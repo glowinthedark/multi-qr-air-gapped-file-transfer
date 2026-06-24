@@ -4,8 +4,8 @@ Send a file from one device to another with **no Wi-Fi, no Bluetooth, no network
 
 Two single-file, dependency-free HTML pages:
 
-- 🔗 🌐 **[`sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes and displays them in a loop.
-- 🔗 🌐 **[`receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** — runs in a browser on the device with a camera. Watches the screen, reconstructs the file, and lets you download it.
+- **[🔗 🌐 `sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes and displays them in a loop.
+- **[🔗 🌐 `receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** — runs in a browser on the device with a camera. Watches the screen, reconstructs the file, and lets you download it.
 
 Both files are fully self-contained: all required libraries are inlined directly into the HTML. Once loaded, neither page makes any network request, ever. They work identically on desktop and mobile (Android/iOS), in any modern browser.
 
