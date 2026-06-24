@@ -15,7 +15,7 @@ Both files are fully self-contained: all required libraries are inlined directly
 
 ### 1. Open the sender
 
-On the device that has the file, just double-click `sender.html` (or open it via `File → Open` in your browser). No server needed for the sender.
+On the device that has the file open **[`sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** or save and double-click `sender.html`. This file works even from the `file://` protocol and no server is needed.
 
 1. Choose a file.
 2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)).
@@ -24,7 +24,7 @@ On the device that has the file, just double-click `sender.html` (or open it via
 
 ### 2. Open the receiver
 
-The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. So you need a tiny local web server on the receiving device:
+Use **[`receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** if you have internet acces on the receiver device. The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. If the receiver device has no internet then you'll need a tiny local web server:
 
 ```bash
 # from the folder containing receiver.html
