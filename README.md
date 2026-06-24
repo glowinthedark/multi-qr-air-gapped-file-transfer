@@ -93,7 +93,7 @@ If the receiving device is an Android phone and you'd rather not use a terminal/
 
 | App | What it does | Source |
 |---|---|---|
-| **Simple HTTP Server** (`com.phlox.simpleserver`) — also on Play Store | Pick a folder, serve it as static HTTP content; shows IP/port, some versions QR-code the URL | [GooglePlay](https://play.google.com/store/apps/details?id=com.phlox.simpleserver) [DevSite]([https://f-droid.org/packages/com.phlox.simpleserver/](https://shttps.phlox.dev/releases/)) |
+| **Simple HTTP Server** (`com.phlox.simpleserver`) — also on Play Store | Pick a folder, serve it as static HTTP content; shows IP/port, some versions QR-code the URL | [GooglePlay](https://play.google.com/store/apps/details?id=com.phlox.simpleserver) [DevSite](https://shttps.phlox.dev/releases/) |
 | **Share via HTTP** (`com.MarcosDiez.shareviahttp`) | Not a standalone server app — adds a "Share via HTTP" entry to Android's share sheet for any file/folder; spins up a temporary server just for that item, with an optional QR code of the URL | [F-Droid](https://f-droid.org/packages/com.MarcosDiez.shareviahttp/) · [GitHub](https://github.com/marcosdiez/shareviahttp) |
 | **lWS – lightweight Web Server** | Under 100 KB, GPL-3.0, static file serving, configurable doc root + port, QR code of the URL | [F-Droid](https://f-droid.org/en/packages/net.basov.lws.fdroid/) |
 | **ServeIt** | Flutter-based, serves a folder (default `/sdcard/Downloads`) on a configurable port, scannable QR | [F-Droid](https://f-droid.org/en/packages/com.example.flutter_http_server/) |
