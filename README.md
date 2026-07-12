@@ -1,13 +1,24 @@
 # Airgap QR Transfer
 
-Send a file from one device to another with **no Wi-Fi, no Bluetooth, no network connectivity of any kind** — using nothing but a screen and a camera.
+Send a file from one device to another with **no Wi-Fi, no Bluetooth, no network connectivity of any kind** — using nothing but a screen and a camera (and, optionally, a speaker and a microphone).
 
 Two single-file, dependency-free HTML pages:
 
-- **[🔗 🌐 `sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes and displays them in a loop.
-- **[🔗 🌐 `receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** — runs in a browser on the device with a camera. Watches the screen, reconstructs the file, and lets you download it.
+- **[🔗 🌐 `sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes (one or four per display frame) and shows them vsync-paced.
+- **[🔗 🌐 `receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)**  — runs in a browser on the device with a camera. Watches the screen, reconstructs the file, verifies it, plays a success chime, and downloads it automatically.
 
 Both files are fully self-contained: all required libraries are inlined directly into the HTML. Once loaded, neither page makes any network request, ever. They work identically on desktop and mobile (Android/iOS), in any modern browser.
+
+**Protocol v2** (current) is a significant rework of v1 for speed and reliability:
+
+- **Systematic first pass** — every block is sent once, verbatim, before any coding; a clean capture completes with zero overhead.
+- **Seed-derived fountain packets** — block indices are re-derived on the receiver from `(sessionId, packetId, k)`, so no index list travels over the wire (and the v1 bug where high-degree packets silently overflowed the QR capacity is structurally impossible).
+- **Metadata piggybacked in every data packet** — the receiver can start (and finish) decoding from the very first frame it sees; the header frame only carries the filename.
+- **Up to 4 QR codes per display frame** (2×2 grid) and frame intervals down to 50 ms.
+- **Frame-change beacon + identical-frame skip** — the receiver cheaply detects stale frames instead of re-decoding them.
+- **Native `BarcodeDetector`** (hardware QR decoding, multi-code per frame) is used automatically once it has been verified binary-safe against jsQR; all decoding runs in a Web Worker off the main thread, with full-resolution ROI tracking.
+- **Audio ACK back-channel (optional)** — the receiver's speaker sends short FSK messages that the sender's microphone decodes: live progress, targeted resend requests for the last few missing blocks, and a DONE signal that auto-stops the sender.
+- **Screen wake locks** on both sides, camera zoom/focus controls, native `CompressionStream` compression when available.
 
 ---
 
@@ -15,16 +26,16 @@ Both files are fully self-contained: all required libraries are inlined directly
 
 ### 1. Open the sender
 
-On the device that has the file open **[`sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** or save and double-click `sender.html`. This file works even from the `file://` protocol and no server is needed.
+On the device that has the file, just double-click `sender.html` (or open it via `File → Open` in your browser). No server needed for the sender.
 
 1. Choose a file.
-2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)).
-3. Click **Start Broadcasting**.
-4. A QR code will start flashing on screen. Leave the tab in the foreground.
+2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)), a frame interval, and how many codes per frame (start with 1; switch to the 2×2 grid when the receiver decodes reliably).
+3. *(Optional but recommended)* Click **Enable ACK Mic** and grant microphone permission — the sender will then stop by itself when the receiver confirms completion, and will prioritize resending exactly the blocks the receiver still misses.
+4. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
 
 ### 2. Open the receiver
 
-Use **[`receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** if you have internet acces on the receiver device. The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. If the receiver device has no internet then you'll need a tiny local web server:
+The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. So you need a tiny local web server on the receiving device:
 
 ```bash
 # from the folder containing receiver.html
@@ -36,49 +47,50 @@ Then open **`http://localhost:8000/receiver.html`** in your browser.
 > No Python? Any static file server works: `npx serve .`, `php -S localhost:8000`, VS Code's "Live Server" extension, etc. The only requirement is that the URL is `localhost` or HTTPS. **On Android specifically**, see [Serving the receiver page from an Android device](#serving-the-receiver-page-from-an-android-device) below for app-based alternatives that don't require a terminal.
 
 1. Click **Start Scanning** and grant camera permission.
-2. Point the camera at the sender's screen, filling as much of the frame as comfortably possible, steady and well-lit.
-3. Watch the progress bar climb. There is no pairing, handshake, or acknowledgement — the sender just broadcasts forever, and the receiver passively accumulates enough data to reconstruct the file.
-4. When it hits 100%, a **Download File** button appears. Click it, and you're done.
-5. On the sender, click **Stop** once you've confirmed the receiver finished.
+2. Point the camera at the sender's screen, filling as much of the frame as comfortably possible, steady and well-lit. Use the zoom slider if your camera exposes one.
+3. Watch the progress bar climb. Transfers usually complete in one pass; losses are repaired automatically by the fountain stream (and by audio-ACK-targeted resends if the sender's mic is enabled).
+4. At 100% the file is CRC-verified, a **success chime plays, and the download starts automatically**. The **Download File** button stays available if you need the file again.
+5. The sender stops by itself if its ACK mic is on; otherwise click **Stop** on the sender once the receiver is done.
 
 ### 3. Sending another file
 
-Click **New Transfer** on the sender (picks a new session, lets you choose a new file) and **Reset Session** on the receiver (clears its decoder state). You don't need to reload either page.
+Click **New Transfer** on the sender (picks a new session, lets you choose a new file) and **Reset Session** on the receiver (clears its decoder state). The receiver also detects a new session on its own after a few frames. You don't need to reload either page.
 
 ---
 
 ## Choosing a preset
 
-| Preset | QR version | Data per frame | Notes |
-|---|---|---|---|
-| **Dense** | 30 (137×137 modules) | ~1.7 KB | Fastest, but needs a steady hand, good focus, and good lighting. Best for laptop screen → phone camera at close range. |
-| **Balanced** *(default)* | 22 (105×105 modules) | ~1.0 KB | Good speed/reliability trade-off for most phone cameras at arm's length. |
-| **Robust** | 15 (77×77 modules), higher error-correction | ~0.4 KB | Slowest, but will scan reliably even with a poor camera, bad lighting, or some hand shake. Use this if Balanced is failing to make progress. |
+| Preset                   | QR version                                  | Data per code | Notes                                                                                                                                        |
+| ------------------------ | ------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Dense**                | 30 (137×137 modules)                        | 1703 B        | Fastest, but needs a steady hand, good focus, and good lighting. Best for laptop screen → phone camera at close range.                       |
+| **Balanced** *(default)* | 22 (105×105 modules)                        | 974 B         | Good speed/reliability trade-off for most phone cameras at arm's length.                                                                     |
+| **Robust**               | 15 (77×77 modules), higher error-correction | 383 B         | Slowest, but will scan reliably even with a poor camera, bad lighting, or some hand shake. Use this if Balanced is failing to make progress. |
 
-If progress stalls or the receiver shows a lot of rejected frames, switch to a more robust preset on the sender (it can be changed before or during a transfer — changing it mid-transfer effectively starts a new session).
-
-Typical real-world throughput is roughly **3–15 KB/s** depending on preset, distance, lighting, and camera quality — a few minutes for a small document, longer for multi-megabyte files. This is intentionally a last-resort, no-infrastructure channel, not a fast one.
+With the 2×2 grid, four codes are shown per frame (each code is smaller on screen, so the camera needs to be closer or the screen bigger). Theoretical rates at Balanced: ~9.7 KB/s at 10 frames/s single-code, ~39 KB/s at 10 frames/s with the grid, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" or miss counts climb, slow the interval down or drop to a single code before reaching for the Robust preset.
 
 ---
 
 ## Reading the receiver's stats panel
 
-| Stat | Meaning |
-|---|---|
-| Blocks solved | How many of the file's internal chunks have been recovered so far. |
-| Pending equations | Partially-useful frames received that don't fully resolve a block yet (normal, will clear up as more frames arrive). |
-| Frames scanned / decoded OK / rejected / duplicate | Rejected = camera caught a frame badly enough that its checksum failed (harmless, just wasted); duplicate = same frame seen twice (harmless). A high rejection rate is a sign to slow down, get closer, improve lighting, or switch to a more robust preset. |
-| Last packet degree | Internal detail — how many file-chunks were XORed together in the most recently decoded frame. |
+| Stat                                        | Meaning                                                                                                                                                                 |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Decoder                                     | Which decode path is active: jsQR in a worker, jsQR on the main thread (fallback), or the native BarcodeDetector once verified.                                         |
+| Blocks solved                               | How many of the file's internal chunks have been recovered so far.                                                                                                      |
+| Pending equations                           | Partially-useful packets received that don't fully resolve a block yet (normal, will clear up as more packets arrive).                                                  |
+| Camera frames processed / identical skipped | Skipped frames were detected as unchanged since the last decode (the sender never repeats a frame, so unchanged = stale) — high skip counts are healthy, they save CPU. |
+| Packets decoded OK / rejected / duplicate   | Rejected = checksum failed (harmless, just wasted); duplicate = same packet seen again within ~1.5 s (camera oversampling; harmless).                                   |
+| Last packet degree                          | Internal detail — how many file-chunks were XORed together in the most recently decoded packet.                                                                         |
+| Audio ACKs                                  | Whether the speaker back-channel is enabled / sending DONE.                                                                                                             |
 
 ---
 
 ## Requirements & limitations
 
-- **Browser**: any reasonably modern Chrome, Safari, Firefox, or Edge — desktop or mobile. No extensions or installs.
+- **Browser**: any reasonably modern Chrome, Safari, Firefox, or Edge — desktop or mobile. No extensions or installs. (The native-decoder and worker paths are progressive enhancements; everything falls back gracefully.)
 - **Receiver needs a camera** and a secure origin (`localhost` or HTTPS) to access it.
 - **Sender needs a screen** large/bright enough for the receiving camera to read comfortably.
-- Both tabs should stay in the **foreground** — mobile browsers throttle or suspend background tabs, which will pause the sender's loop or starve the receiver's scan loop.
-- This is a **one-way visual channel** — there's no return path, no acknowledgements, and that's by design (true air-gap compatible: works even if the receiver has no way to signal back to the sender at all).
+- Both tabs should stay in the **foreground** — mobile browsers throttle or suspend background tabs. Both pages take a screen wake lock while active so the display won't sleep mid-transfer.
+- The visual channel is **one-way**; the audio ACK channel is an optional enhancement, not a requirement — with it disabled the protocol degrades to pure broadcast exactly like v1.
 - Practical file size range: anything from a few bytes up to tens of megabytes works in principle; very large files just mean a longer broadcast. There's no hard cap baked in beyond the protocol's 65,535-block ceiling (see technical section).
 
 ---
@@ -91,20 +103,19 @@ If the receiving device is an Android phone and you'd rather not use a terminal/
 
 **On F-Droid** (open source, installable without a Google account):
 
-| App | What it does | Source |
-|---|---|---|
-| **Simple HTTP Server** (`com.phlox.simpleserver`) — also on Play Store | Pick a folder, serve it as static HTTP content; shows IP/port, some versions QR-code the URL | [GooglePlay](https://play.google.com/store/apps/details?id=com.phlox.simpleserver) [DevSite](https://shttps.phlox.dev/releases/) |
-| **Share via HTTP** (`com.MarcosDiez.shareviahttp`) | Not a standalone server app — adds a "Share via HTTP" entry to Android's share sheet for any file/folder; spins up a temporary server just for that item, with an optional QR code of the URL | [F-Droid](https://f-droid.org/packages/com.MarcosDiez.shareviahttp/) · [GitHub](https://github.com/marcosdiez/shareviahttp) |
-| **lWS – lightweight Web Server** | Under 100 KB, GPL-3.0, static file serving, configurable doc root + port, QR code of the URL | [F-Droid](https://f-droid.org/en/packages/net.basov.lws.fdroid/) |
-| **ServeIt** | Flutter-based, serves a folder (default `/sdcard/Downloads`) on a configurable port, scannable QR | [F-Droid](https://f-droid.org/en/packages/com.example.flutter_http_server/) |
-| **HTTP FS file server** | More featured — also supports WebDAV/HTTPS, password protection, QR code | [GitHub](https://github.com/Tiarait/HTTP-FS-file-server) |
+| App                                                                    | What it does                                                                                                                                                                                  | Source                                                                                                                      |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Simple HTTP Server** (`com.phlox.simpleserver`) — also on Play Store | Pick a folder, serve it as static HTTP content; shows IP/port, some versions QR-code the URL                                                                                                  | [F-Droid](https://f-droid.org/packages/com.phlox.simpleserver/)                                                             |
+| **Share via HTTP** (`com.MarcosDiez.shareviahttp`)                     | Not a standalone server app — adds a "Share via HTTP" entry to Android's share sheet for any file/folder; spins up a temporary server just for that item, with an optional QR code of the URL | [F-Droid](https://f-droid.org/packages/com.MarcosDiez.shareviahttp/) · [GitHub](https://github.com/marcosdiez/shareviahttp) |
+| **lWS – lightweight Web Server**                                       | Under 100 KB, GPL-3.0, static file serving, configurable doc root + port, QR code of the URL                                                                                                  | [F-Droid](https://f-droid.org/en/packages/net.basov.lws.fdroid/)                                                            |
+| **ServeIt**                                                            | Flutter-based, serves a folder (default `/sdcard/Downloads`) on a configurable port, scannable QR                                                                                             | [F-Droid](https://f-droid.org/en/packages/com.example.flutter_http_server/)                                                 |
+| **HTTP FS file server**                                                | More featured — also supports WebDAV/HTTPS, password protection, QR code                                                                                                                      | [GitHub](https://github.com/Tiarait/HTTP-FS-file-server)                                                                    |
 
-<!--
 **Directly from GitHub** (build or sideload the APK; not necessarily on F-Droid):
 
 - [`android-http-server`](https://github.com/piotrpolak/android-http-server) (piotrpolak) — zero-dependency Java servlet container, GPLv3
 - [`android-http-server`](https://github.com/zahidaz/android-http-server) (zahidaz) — modern Ktor/Kotlin-coroutines based, actively maintained
--->
+
 ### Well-known general-purpose apps with a built-in "expose via HTTP" feature
 
 These are apps many people already have installed for other reasons, which happen to include a local web-server mode — handy since it avoids installing anything new just for this:
@@ -122,7 +133,7 @@ These are apps many people already have installed for other reasons, which happe
 <details>
 <summary><strong>📖 Full technical explanation (click to expand)</strong></summary>
 
-## Overview of the pipeline
+## Overview of the pipeline (protocol v2)
 
 ```
 SENDER                                                    RECEIVER
@@ -130,182 +141,172 @@ SENDER                                                    RECEIVER
 file bytes
    │
    ▼
-deflateRaw (pako)              ──── compressed bytes ───►
+deflate-raw (native CompressionStream,
+pako fallback)
    │
    ▼
 split into k fixed-size blocks
    │
    ▼
-Robust Soliton fountain encoder
-   │  (infinite stream of XOR-combined,
-   │   degree-tagged, explicit-index packets)
-   ▼
-QR-encode each packet (byte mode)
-   │
-   ▼
-render to <canvas>, loop forever  ──camera──►  jsQR decode
-                                                    │
-                                                    ▼
-                                          parse packet, CRC32 check
-                                                    │
-                                                    ▼
-                                          incremental GF(2) Gaussian
-                                          elimination (online solver)
-                                                    │
-                                          (repeat until k blocks solved)
-                                                    ▼
-                                          reassemble compressed buffer
-                                                    │
-                                          CRC32-verify whole payload
-                                                    ▼
-                                          inflateRaw (pako)
-                                                    │
-                                          verify length, trigger download
+systematic pass: packetId 0..k-1 =                camera (1080p/60 requested,
+block i verbatim; then endless fountain           requestVideoFrameCallback)
+packets whose indices BOTH sides derive                   │
+from (sessionId, packetId, k) via a                       ▼
+shared deterministic PRNG                         decode Web Worker:
+   │                                              identical-frame skip (16×16
+   ▼                                              luminance signature) → jsQR
+1 or 4 QR codes per display frame,                with full-res ROI tracking, or
+vsync-paced (rAF), pre-built during the           native BarcodeDetector once
+previous frame's window, plus an                  verified binary-safe
+alternating beacon bar                                    │
+   │                                                      ▼
+   └────────────── light ────────────────►       parse packet, CRC32 check,
+                                                 re-derive indices from packetId
+   ┌───────────── sound ─────────────────┐               │
+   │ (optional FSK ACKs: progress,       │               ▼
+   │  missing-block NACKs, DONE)         │       incremental GF(2) Gaussian
+   ▼                                     │       elimination (Uint32 XOR lanes)
+sender mic demodulates ACKs:             │               │
+targeted resends + auto-stop             └──── speaker ──┤
+                                                          ▼
+                                                 reassemble, CRC32-verify,
+                                                 inflate, verify length,
+                                                 chime + auto-download
 ```
 
 ## Why a fountain code instead of "just send chunks in order"
 
-A naive approach — chunk the file, QR-encode each chunk, cycle through them — requires the receiver to catch **every single chunk** at least once. Camera-based scanning is lossy: motion blur, autofocus hunting, screen glare, and timing jitter mean some fraction of displayed frames will simply never be read. With sequential chunking, a single permanently-missed frame means the file can never be completed without some kind of retransmission request — which requires a return channel. There is no return channel here, on purpose (this works even if the receiving device has no way whatsoever to signal back).
+A naive approach — chunk the file, QR-encode each chunk, cycle through them — requires the receiver to catch **every single chunk** at least once. Camera-based scanning is lossy: motion blur, autofocus hunting, screen glare, and timing jitter mean some fraction of displayed frames will simply never be read. With sequential chunking, a single permanently-missed frame means the file can never be completed without a retransmission request.
 
-**Fountain codes** (this project uses a **Luby Transform / LT code** with a **Robust Soliton** degree distribution) solve this elegantly:
+**Fountain codes** (this project uses a **Luby Transform / LT code**) solve this elegantly:
 
-- Each transmitted packet is not "block #7" but a **random linear combination** (XOR, since we're in GF(2)) of a small, randomly-chosen subset of the file's blocks.
-- The sender just keeps generating and displaying *new* random packets forever, in a loop, with no notion of which ones the receiver has or hasn't seen.
-- The receiver needs to successfully capture **any** sufficiently large set of these packets — not a specific one — to mathematically reconstruct the original blocks via linear algebra (Gaussian elimination over GF(2), described below).
-- The number of packets needed to fully decode `k` blocks is `k` plus a small overhead (empirically ~10–60% depending on `k` and luck), regardless of *which* packets were lost. Loss just means "wait a bit longer," never "transfer is stuck forever."
+- Each coded packet is a **random XOR combination** of a randomly-chosen subset of the file's blocks.
+- The sender keeps generating *new* packets forever with no notion of which ones the receiver has seen.
+- The receiver needs **any** sufficiently large set of packets — not specific ones — to reconstruct all blocks via Gaussian elimination over GF(2).
+- Loss just means "wait a bit longer," never "transfer is stuck forever."
 
-This is exactly the property needed for a one-way, no-feedback, lossy optical channel.
+v2 additionally makes the stream **systematic**: `packetId 0..k-1` are defined as "block `i` verbatim" (degree 1). On a good link the whole file arrives in the first pass with zero coding overhead and zero solver work; the fountain packets that follow exist purely to repair whatever the camera missed.
 
-### Degree distribution and why indices are sent explicitly
+### Seed-derived indices and cross-engine determinism
 
-LT codes need a *degree distribution* — a probability distribution over "how many blocks should this packet XOR together." The classic choice, used here, is the **Robust Soliton distribution**: mostly low degrees (lots of degree-1 and degree-2 packets, which resolve instantly or near-instantly) with a deliberate "spike" of higher-degree packets to guarantee, with high probability, that the decoding process never stalls before finishing.
+v2 does **not** transmit the per-packet index list. Both sides derive the degree and the block indices from `(sessionId, packetId, k)` using an identical PRNG (an xorshift32 core seeded via integer hashing — `Math.imul`, shifts, xors: exact integer ops everywhere).
 
-A textbook LT code implementation often derives both the *degree* and the *specific source-block indices* for a packet from a shared deterministic pseudo-random seed (e.g. the packet's sequence number), so the receiver can regenerate the same indices without the sender ever transmitting them — saving bandwidth.
+The classic objection (and the reason v1 sent explicit indices) is that the degree distribution's construction uses floating-point math, and `Math.log` is **not** guaranteed bit-identical across JavaScript engines — a single one-ulp disagreement between, say, desktop Chrome and mobile Safari could make the receiver assume the wrong indices for a packet and silently corrupt the linear system. v2 removes the hazard instead of the feature:
 
-**This implementation deliberately does not do that.** The seed-based approach requires the sender's and receiver's PRNG and degree-distribution math to agree *bit-for-bit*, which in turn depends on `Math.log`/`Math.sqrt` producing identical floating-point results across potentially two different JavaScript engines (e.g. desktop Chrome vs. mobile Safari). The ECMAScript spec does **not** guarantee bit-identical transcendental math across implementations. A single floating-point disagreement would cause the receiver to assume the wrong set of indices for a packet — silently corrupting the linear system with no way to detect it from a CRC alone (the CRC only validates that the *XORed payload bytes* weren't corrupted by the camera; it can't detect "the receiver decided the wrong indices belong to this XOR").
+- The distribution is built using **only IEEE-754 correctly-rounded operations** (`+ - * /`, `Math.sqrt`, `Math.floor`), which the spec *does* guarantee bit-identical everywhere.
+- The natural log needed by the Robust Soliton parameters is computed by `detLog()` — an atanh power series with a *fixed* iteration count. Whether or not the series result equals the true logarithm to the last bit is irrelevant; what matters is that every engine computes the *same* sequence of correctly-rounded operations and therefore the *same* double.
+- The two files carry byte-identical copies of `detLog`, `buildDegreeCDF`, `pktRandom`, and `indicesForPacket` (verifiable with `diff`), and the whole-file CRC32 check at completion remains as the end-to-end backstop.
 
-So instead, **each packet explicitly carries its own degree and the exact list of source-block indices it XORs together** (as part of the packet bytes, protected by the same CRC32 as the payload). This costs a small amount of extra bandwidth (a few bytes per packet) but makes the protocol's correctness independent of any floating-point determinism assumption — sender and receiver only need to agree on byte layout, which is checked and enforced by CRC32, not on reproducing each other's arithmetic. Given the explicit goal of being "failsafe," this tradeoff was made deliberately in favor of provable correctness over a marginal bandwidth saving.
+This recovers `1 + 2×degree` bytes per packet (up to 121 B — 12% of a Balanced frame in v1), makes every data packet a fixed size (v1 packets with degree > 8 exceeded the QR capacity and silently failed to render), and removes the need for any degree cap.
 
-### The Robust Soliton CDF (sender-side only)
+### The degree distribution
 
-```
-rho[1]    = 1/k
-rho[i]    = 1/(i·(i-1))                          for i = 2..k
-S         = c · ln(k/δ) · √k                     (spike width, c=0.1, δ=0.05)
-tau[i]    = S/(k·i)                              for i = 1..(k/S − 1)
-tau[k/S] += S · ln(S/δ) / k                       (the spike itself)
-mu[i]     = (rho[i] + tau[i]) / Σ(rho+tau)
-CDF[i]    = Σ_{j≤i} mu[j]
-```
+70% of the probability mass is a standard **Robust Soliton** (`c = 0.1`, `δ = 0.05`); the remaining 30% is placed on a single "dense" degree `min(⌊k/2⌋, 512)` (floored at 8). Rationale: the receiver runs *full* Gaussian elimination, not just peeling. In the endgame — a handful of blocks missing after the systematic pass — sparse low-degree packets mostly hit already-solved blocks (coupon-collector waste), whereas a dense row is almost always linearly independent. Simulation across `k` = 10…8000 at 15–25% frame loss shows ~10% reception overhead with this mixture, versus 50%+ for a plain soliton feeding a GE decoder in the same regime.
 
-For each packet, the sender draws `u = Math.random()`, finds the smallest `i` such that `CDF[i] ≥ u` via binary search, and that `i` is the packet's degree. Then it picks `i` distinct block indices uniformly at random (rejection sampling: keep drawing random indices into a `Set` until it has `i` distinct ones).
-
-Because this entire calculation happens **only on the sender**, and the result is transmitted explicitly rather than re-derived, there is no cross-engine determinism requirement anywhere in the protocol.
+For each packet, `u = rng()/2³²` selects a degree by binary search over the CDF; the indices are then drawn without replacement using the same per-packet PRNG stream (with a deterministic sequential fallback if rejection sampling stalls). `packetId < k` bypasses all of this (systematic).
 
 ## Wire format
 
-Two packet types, distinguished by a leading type byte. All multi-byte integers are big-endian (`DataView` default).
+Two packet types, distinguished by a leading type byte. All multi-byte integers are big-endian (`DataView` default). Type `0x01` (the v1 data packet) is retired; the receiver logs a version-mismatch warning if it sees one.
 
 ### Header packet (type `0x00`)
 
-Re-broadcast periodically (every 12 frames by default) so the receiver can pick it up quickly regardless of when it starts watching.
+Sent as the first two frames and every 40th frame thereafter. Since v2 piggybacks all numeric metadata in every data packet, the header's only unique cargo is the **filename** — a transfer completes fine without ever catching one (the file is then named `received_file.bin`).
 
-| Field | Size | Description |
-|---|---|---|
-| type | 1 B | `0x00` |
-| sessionId | 4 B | Random per-file session identifier |
-| fileNameLen | 1 B | Length of the filename in bytes (UTF-8, truncated to 255 B) |
-| fileName | variable | UTF-8 filename |
-| originalSize | 4 B | Size of the file before compression |
-| compressedSize | 4 B | Size after `deflateRaw` |
-| blockSize | 2 B | Fixed size of every block (last block zero-padded) |
-| k | 2 B | Number of blocks |
-| crcCompressed | 4 B | CRC32 of the entire compressed payload |
-| headerCrc | 4 B | CRC32 of all preceding header bytes |
+| Field          | Size     | Description                                                 |
+| -------------- | -------- | ----------------------------------------------------------- |
+| type           | 1 B      | `0x00`                                                      |
+| sessionId      | 4 B      | Random per-file session identifier                          |
+| fileNameLen    | 1 B      | Length of the filename in bytes (UTF-8, truncated to 255 B) |
+| fileName       | variable | UTF-8 filename                                              |
+| originalSize   | 4 B      | Size of the file before compression                         |
+| compressedSize | 4 B      | Size after deflate                                          |
+| blockSize      | 2 B      | Fixed size of every block (last block zero-padded)          |
+| k              | 2 B      | Number of blocks                                            |
+| crcCompressed  | 4 B      | CRC32 of the entire compressed payload                      |
+| headerCrc      | 4 B      | CRC32 of all preceding header bytes                         |
 
-### Data packet (type `0x01`)
+### Data packet (type `0x02`) — fixed size, exactly fills the QR
 
-| Field | Size | Description |
-|---|---|---|
-| type | 1 B | `0x01` |
-| sessionId | 4 B | Must match the header's session |
-| packetId | 4 B | Monotonically increasing counter (used for dedup, not for index derivation) |
-| degree | 1 B | Number of source blocks XORed into this packet (1–60) |
-| indices | `2 × degree` B | The source block indices (uint16 each) |
-| payload | `blockSize` B | XOR of the listed source blocks |
-| payloadCrc | 4 B | CRC32 of the payload bytes |
+| Field          | Size          | Description                                                                         |
+| -------------- | ------------- | ----------------------------------------------------------------------------------- |
+| type           | 1 B           | `0x02`                                                                              |
+| sessionId      | 4 B           | Session identifier                                                                  |
+| packetId       | 4 B           | `< k`: systematic (block = packetId). `≥ k`: fountain; indices derived from this id |
+| k              | 2 B           | Number of blocks (piggybacked metadata)                                             |
+| blockSize      | 2 B           | Block size (piggybacked)                                                            |
+| compressedSize | 4 B           | (piggybacked)                                                                       |
+| originalSize   | 4 B           | (piggybacked)                                                                       |
+| crcCompressed  | 4 B           | (piggybacked)                                                                       |
+| payload        | `blockSize` B | The block itself, or the XOR of the derived index set                               |
+| packetCrc      | 4 B           | CRC32 over all preceding bytes                                                      |
 
-Per-frame overhead is therefore `14 + 2·degree` bytes on top of the raw block payload — small relative to the ~400–1700 byte payloads used in practice.
+Overhead is a constant **29 bytes**, so `blockSize = QR byte capacity − 29` (1703 / 974 / 383 B for Dense / Balanced / Robust).
 
-## QR encoding details
+## Audio ACK back-channel (optional)
 
-- Uses [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator) (MIT) in **byte mode**, with its default UTF-8 `stringToBytes` function overridden to a raw 1-byte-per-char-code mapping — necessary because the packets are arbitrary binary data, not text, and the library's default would mangle any byte ≥ 0x80 by re-encoding it as multi-byte UTF-8.
-- A fixed QR version/error-correction-level pair is used per preset (rather than auto-sizing), so every frame in a session has identical dimensions — this keeps the receiver's camera focus/exposure stable instead of constantly re-adjusting to varying QR densities.
-- Rendering is done by hand onto a `<canvas>`, module-by-module via `fillRect`, with the canvas's pixel dimensions chosen as an **exact integer multiple** of the QR's module count (`moduleCount + 2×quietZone`). This guarantees every module renders as a crisp, pixel-aligned square with no sub-pixel blending — a real and common failure mode when QR codes are rendered via scaled `<img>` tags or non-integer canvas scaling, which introduces anti-aliased gray edges that confuse camera-based decoders.
-- A 4-module quiet zone border is included, as required by the QR spec for reliable finder-pattern detection.
+Receiver speaker → sender microphone. 16-FSK: sixteen data tones at 1500–4200 Hz (180 Hz apart), separator tone 1150 Hz, preamble alternating 4700/4400 Hz, 90 ms slots. Each message is `preamble(4 slots) · [SEP, nibble]×2·len · END(4700 Hz)` with a CRC-8 (poly `0x07`) appended:
 
-QR error-correction level **L** (the lowest, ~7% recoverable damage) is used deliberately even though higher levels exist. Since the fountain code already provides redundancy *across* frames, paying for *within-frame* redundancy via a higher ECC level (M/Q/H) would only reduce usable payload per frame for limited benefit — the "Robust" preset is the exception, using ECC **M**, intended specifically for situations where individual frames are likely to be partially unreadable (bad lighting/focus) rather than relying purely on inter-frame redundancy.
+- **DONE** `[0xD1, sessionIdLow]` — repeated up to 10 times after completion. The sender verifies the session byte, stops broadcasting, and plays the chime.
+- **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — sent every ~5 s once ≥ 85% of blocks are solved. The sender displays the receiver's progress and pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
+
+Data rate is tiny (~20 bit/s) and that's fine: the QR channel carries the data; sound only carries *control*. The success chime uses notes at 523–1047 Hz, entirely below the FSK band, so it can never be mistaken for a symbol. Everything works with the channel disabled — it's an accelerator, not a dependency.
+
+## QR encoding & display details
+
+- [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator) (MIT) in **byte mode**, with `stringToBytes` overridden to a raw 1-byte-per-char-code mapping (payloads are binary, not UTF-8).
+- Fixed QR version per preset so every frame has identical dimensions — keeps camera focus/exposure stable.
+- Each code is generated as a **1-pixel-per-module `ImageData`** (4-module quiet zone included) and blitted with `imageSmoothingEnabled = false` at an exact integer scale — crisp, pixel-aligned modules with no anti-aliased edges, and far cheaper than per-module `fillRect`.
+- Frame pacing uses `requestAnimationFrame` (vsync-aligned), with the *next* frame's codes built incrementally during the *current* frame's display window, so a swap is just a blit. Missed deadlines are counted in the stats ("Missed swap deadlines").
+- Below the code grid, a **beacon bar** (two half-bars swapping black/white every frame) makes frame changes trivially observable.
+- ECC level **L** for Dense/Balanced (inter-frame redundancy comes from the fountain code, so paying for intra-frame redundancy is usually a bad trade), **M** for Robust.
+
+## Receiver capture & decode details
+
+- Camera is requested at 1920×1080@60 with `facingMode: environment`; continuous autofocus is applied when supported and a zoom slider appears when the track exposes zoom.
+- `video.requestVideoFrameCallback` (rAF fallback) fires once per *camera* frame; exactly one frame is in flight at a time (natural backpressure).
+- All pixel work happens in a **Web Worker** (the vendored jsQR source is stored in an inert `text/plain` script tag and prepended into the worker blob; if workers/OffscreenCanvas are unavailable, it's eval'd on the main thread as a fallback).
+- **ROI tracking**: full-frame search (alternating whole-frame and 2×2 quadrant sweeps, for grid mode) until a code is found, then each known code region is cropped from the **full-resolution** frame — no global downscale throwing away module detail. Boxes follow drift, expire after repeated misses, and a periodic sweep discovers additional grid cells.
+- **Identical-frame skip**: a 16×16 luminance signature per region; if it matches the last attempt, the decode is skipped (the sender never shows the same packet twice in a row, so an unchanged region is always stale). This is where most of the "duplicate decode" CPU waste of v1 went.
+- **Native `BarcodeDetector`**: if present, it runs in *probation* alongside jsQR and must return byte-identical results 4 times before taking over (its `rawValue` is a string; on binary-safe platforms that's a 1:1 Latin-1 mapping, on others it mangles bytes ≥ 0x80 — probation detects which world we're in using real traffic, no test assets needed). Once active, it decodes full frames in hardware, multiple codes at once. Any rare packet that happens to decode as valid UTF-8 and gets mangled simply fails its CRC and is repaired by the fountain stream.
 
 ## Decoding: incremental Gaussian elimination over GF(2)
 
-This is the core algorithm that makes the receiver tolerant of frames arriving in **any order**, with **any pattern of loss**, with no time limit. It's mathematically equivalent to maintaining a partial row-echelon form of a linear system, where "rows" are XOR-equations and "addition" is XOR.
+Unchanged in spirit from v1 — an online row-echelon solver where rows are XOR-equations:
 
-### Data structures
+- `solved: Map<blockIndex, row>` — fully known blocks.
+- `pivots: Map<pivotIndex, {indices: Set, row}>` — partially-reduced equations keyed by their smallest unknown index.
 
-- `solved: Map<blockIndex, Uint8Array>` — blocks that are fully known.
-- `pivots: Map<pivotIndex, {indices: Set<number>, data: Uint8Array}>` — partially-reduced equations, keyed by the smallest still-unknown block index they reference.
+New rows are first reduced against `solved`, then against colliding pivots (symmetric difference on the index set, XOR on the payload); a row that drops to degree 1 solves its block and **cascades** through all pending pivots. One algorithm covers both the fast peeling path and full elimination, and completes as soon as `k` linearly-independent equations have arrived.
 
-### Algorithm (`addRow`)
-
-When a new packet arrives with index-set `I` and XORed payload `D`:
-
-1. **Reduce against known blocks.** For every index in `I` that's already in `solved`, XOR its known value into `D` and remove that index from `I`. (If a block is already known, it no longer contributes unknown information to this equation.)
-2. If `I` is now empty, this packet was fully redundant — discard it (in principle its data should now be all-zero if everything is consistent; this is not currently asserted, but a non-zero residue here would indicate a corrupted packet that slipped past the CRC, which is astronomically unlikely given a 32-bit checksum).
-3. Otherwise, **reduce against existing pivot rows**: let `p` = the smallest index still in `I`.
-   - If a pivot row already exists for `p`: XOR that pivot row's index-set and data into `I`/`D` (symmetric difference for the index set, XOR for the data), and go back to step 2/3 with the updated `I`/`D`.
-   - If no pivot exists for `p`: this row *becomes* the new pivot for `p`.
-     - If `I` now contains only `p` itself (degree 1), block `p` is fully solved: move it into `solved` and trigger a **cascade**.
-
-### Cascade
-
-Solving a new block can make previously-stuck pivot rows solvable. The cascade walks every existing pivot row, removes the newly-solved index wherever it appears (XORing in its now-known value), and recursively solves and cascades any row that drops to degree 1 as a result. This is a standard **peeling decoder** step, here folded into the same structure as the Gaussian elimination rather than implemented as a separate pass — meaning there's no separate "try peeling, then fall back to full elimination" logic; one algorithm handles both, and is guaranteed to find every block as soon as the receiver has accumulated `k` linearly-independent equations (i.e., full rank), regardless of whether that happens via the fast "instant degree-1" path or the slower full-elimination path.
-
-This is genuinely just **Gaussian elimination over GF(2)**, maintained incrementally one row at a time instead of batched — which is what allows it to process frames as they arrive, live, with no fixed batch size or retry logic.
+v2 performance changes: payload buffers are 4-byte padded and XORed as `Uint32Array` lanes (4× fewer operations on ~1 KB blocks), and packet dedup is a small time-windowed map (~1.5 s) rather than an ever-growing set — camera oversampling duplicates are caught, while audio-ACK-triggered resends of old packet ids are correctly accepted (and redundant rows reduce to nothing for near-zero cost anyway).
 
 ### Completion and integrity verification
 
-Once `solved.size === k`:
-
-1. Concatenate all `k` solved blocks in order, then truncate to the header's `compressedSize` (undoing the zero-padding applied to the final block on the sender side).
-2. Compute CRC32 over that trimmed buffer and compare against the header's `crcCompressed`. If it doesn't match, the reconstruction is **not** accepted — the decoder keeps listening for more frames rather than offering a corrupted file. (In practice this should essentially never trigger, since every individual packet was already CRC-checked before being fed into the solver — this is a final end-to-end belt-and-suspenders check.)
-3. `pako.inflateRaw` to decompress, and verify the resulting length matches the header's `originalSize` as a sanity check.
-4. Only then is the download button enabled.
+Once `solved.size === k`: concatenate, truncate to `compressedSize`, CRC32-verify against `crcCompressed`, `inflateRaw`, verify `originalSize`. Only then: chime, auto-download, and DONE ACKs. A failed check keeps the decoder listening rather than delivering a corrupt file.
 
 ## Session handling
 
-Each prepared file gets a random 32-bit `sessionId`. Because there's no handshake, the receiver must guard against two things:
-
-- **Stale data from a previous transfer.** Solved blocks and pivot rows are namespaced by session implicitly (any reset clears the whole solver state).
-- **A single misread frame falsely appearing to start a new session.** A camera misread could, in principle, decode to a syntactically valid packet with a corrupted `sessionId` field that happens to pass its own CRC by chance (1-in-4-billion-ish for a random 32-bit collision against an unrelated CRC, but not literally impossible). To avoid one such fluke nuking an in-progress transfer, a *different* session ID has to appear **three times** before the receiver commits to switching to it. A genuine new transfer (sender clicked "New Transfer") will naturally repeat its new session ID every frame, satisfying this within a fraction of a second; a one-off fluke will not repeat and is ignored.
+Each prepared file gets a random 32-bit `sessionId`. A *different* session ID must appear in **three** CRC-valid packets before the receiver abandons an in-progress transfer for it — a genuine new transfer satisfies this within a fraction of a second, while a fluke misread cannot.
 
 ## Compression
 
-`pako.deflateRaw` (raw DEFLATE, no zlib/gzip header) is used to shrink the payload before fountain-encoding, since fewer bytes directly means fewer blocks/frames/seconds. Raw deflate (rather than full gzip) is used purely to shave a few header/footer bytes that would otherwise be redundant with this protocol's own framing and checksums. Highly-compressible files (text, structured data) benefit enormously; already-compressed or random/encrypted data will see `compressedSize ≈ originalSize` and that's expected.
+Raw DEFLATE (`CompressionStream('deflate-raw')` when the browser has it — off the main thread and much faster on big files — with `pako.deflateRaw` as the fallback; the receiver inflates with pako). Fewer bytes directly means fewer blocks/frames/seconds. Already-compressed data will see `compressedSize ≈ originalSize`, which is expected.
 
 ## Libraries used (all vendored/inlined, MIT/Apache-2.0)
 
-| Library | Purpose | License |
-|---|---|---|
-| [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator) | QR encoding (sender) | MIT |
-| [`jsQR`](https://github.com/cozmo/jsQR) | QR decoding from camera frames (receiver) | Apache-2.0 |
-| [`pako`](https://github.com/nodeca/pako) | DEFLATE compression/decompression | MIT/Zlib |
+| Library                                                                 | Purpose                                    | License    |
+| ----------------------------------------------------------------------- | ------------------------------------------ | ---------- |
+| [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator) | QR encoding (sender)                       | MIT        |
+| [`jsQR`](https://github.com/cozmo/jsQR)                                 | QR decoding from camera frames (receiver)  | Apache-2.0 |
+| [`pako`](https://github.com/nodeca/pako)                                | DEFLATE compression/decompression fallback | MIT/Zlib   |
 
-All three are included verbatim inside the HTML files — there are no `<script src="https://...">` references anywhere, by design, so the tool keeps working with zero connectivity after the initial page load.
+All are included verbatim inside the HTML files — there are no `<script src="https://...">` references anywhere, by design.
 
 ## Known limits
 
-- Max `k` (block count) is 65,535 due to the 16-bit block-index field. At the smallest practical block size (~400 B under the Robust preset) that's a ceiling of roughly 25 MB; with larger blocks (Dense preset, ~1.7 KB) it's closer to 100+ MB. Far larger than what's practical to transfer at a few KB/s over a camera anyway.
-- Max degree per packet is capped at 60 to bound per-packet index overhead; this is independent of `k` and works fine across the full supported range.
-- There is intentionally no automatic retry/ack protocol — by design, this works over a channel with **zero return path**. The only "control" signal is the human deciding when to click Stop.
+- Max `k` (block count) is 65,535 due to the 16-bit block-count field. At the smallest block size (Robust, 383 B) that's a ceiling of roughly 24 MB compressed; with the Dense preset it's ~110 MB.
+- The audio ACK channel assumes the two devices are within normal speaking distance in a reasonably quiet room; in a loud environment just leave it off — the protocol degrades to pure one-way broadcast.
+- Sender and receiver must be the **same protocol version** (v2 files, as shipped together). A v2 receiver logs a clear warning if it sees v1 packets.
 
 </details>

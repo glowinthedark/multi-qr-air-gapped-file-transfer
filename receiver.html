@@ -58,6 +58,15 @@
       <span id="statusBadge" class="badge idle">IDLE</span>
       <span class="hint" id="permHint">Camera access requires HTTPS or localhost. Tap "Start Scanning" to grant permission.</span>
     </div>
+    <div class="row" style="margin-top:8px;">
+      <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="ackChk" checked> Send audio ACKs to the sender (speaker)
+      </label>
+      <div id="zoomRow" style="display:none;flex:1;min-width:160px;">
+        <label>Camera zoom</label>
+        <input type="range" id="zoomSlider" style="width:100%;">
+      </div>
+    </div>
   </div>
 
   <div class="panel">
@@ -90,8 +99,11 @@
 
 <!-- ===================== Vendored library: jsQR =====================
      Source: https://github.com/cozmo/jsQR (Apache-2.0 license)
+     NOTE: deliberately inert (type="text/plain") — the source is prepended
+     into the decode Web Worker's blob at runtime (and eval'd on the main
+     thread only as a fallback when workers are unavailable).
 ============================================================================ -->
-<script>
+<script type="text/plain" id="jsqrSrc">
 (function webpackUniversalModuleDefinition(root, factory) {
 	if(typeof exports === 'object' && typeof module === 'object')
 		module.exports = factory();
@@ -10207,13 +10219,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     document.body.innerHTML = '<div style="padding:24px;color:#e06464;font-family:monospace;white-space:pre-wrap;">FATAL: '+msg+'</div>';
     throw new Error(msg);
   }
-  if (typeof jsQR === 'undefined') fatal('jsQR library failed to load (QR decoding unavailable).');
+  var jsqrSrcEl = document.getElementById('jsqrSrc');
+  if (!jsqrSrcEl) fatal('jsQR library source block is missing (QR decoding unavailable).');
+  if (typeof pako === 'undefined') fatal('pako library failed to load (inflate unavailable).');
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    fatal('Camera API (getUserMedia) is not available. This page must be served over HTTPS or http://localhost, and your browser must support it (any modern Chrome/Safari/Firefox/Edge, desktop or mobile, qualifies).');
+    fatal('Camera API (getUserMedia) is not available. This page must be served over HTTPS or http://localhost, and your browser must support it (any modern Chrome/Safari/Firefox/Edge does).');
   }
 
   // ---------------------------------------------------------------------
-  // CRC32 (must exactly match the sender's implementation)
+  // CRC32 / CRC8 (must exactly match the sender's implementations)
   // ---------------------------------------------------------------------
   var CRC32_TABLE = (function(){
     var table = new Uint32Array(256);
@@ -10230,9 +10244,88 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     for (var i=start;i<end;i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
     return (crc ^ 0xFFFFFFFF) >>> 0;
   }
+  function crc8(bytes){
+    var c = 0;
+    for (var i=0;i<bytes.length;i++){
+      c ^= bytes[i];
+      for (var b=0;b<8;b++) c = (c & 0x80) ? ((c<<1)^0x07)&0xff : (c<<1)&0xff;
+    }
+    return c;
+  }
 
-  // pako is only needed for inflateRaw on this side. Vendored separately so
-  // this file is self-contained even if opened without the sender page.  if (typeof pako === 'undefined') fatal('pako library failed to load (inflate unavailable).');
+  // ---------------------------------------------------------------------
+  // Deterministic fountain-code degree distribution + per-packet PRNG.
+  // EXACT copies of the sender's functions — the block indices of every
+  // data packet are re-derived here from (sessionId, packetId, k). Only
+  // IEEE-754 correctly-rounded ops are used (no Math.log/pow), so sender
+  // and receiver compute bit-identical results on any JS engine.
+  // ---------------------------------------------------------------------
+  function detLog(x){
+    // natural log via atanh series with a fixed iteration count. Every op is
+    // IEEE-754 correctly-rounded, so the result is bit-identical on all JS
+    // engines (Math.log is NOT guaranteed to be, and any divergence between
+    // sender and receiver would corrupt the derived packet indices).
+    var e = 0;
+    while (x >= 2){ x /= 2; e++; }
+    while (x < 1){ x *= 2; e--; }
+    var t = (x-1)/(x+1), t2 = t*t, sum = 0, term = t;
+    for (var n=1;n<=19;n+=2){ sum += term/n; term *= t2; }
+    return 2*sum + e*0.6931471805599453;
+  }
+  function buildDegreeCDF(k){
+    // Robust soliton (c=0.1, delta=0.05) carrying 70% of the mass, plus a
+    // 30% "dense row" component at degree ~min(k/2, 512). The receiver does
+    // full Gaussian elimination (not just peeling), and dense rows are far
+    // more likely to be linearly independent in the endgame — this cuts the
+    // fountain reception overhead to roughly 10%.
+    if (k < 1) k = 1;
+    var mu = new Float64Array(k+1);
+    mu[1] = 1/k;
+    for (var i=2;i<=k;i++) mu[i] = 1/(i*(i-1));
+    var c = 0.1, delta = 0.05;
+    var S = c*detLog(k/delta)*Math.sqrt(k);
+    if (S < 1) S = 1;
+    var kS = Math.floor(k/S);
+    if (kS >= 1){
+      for (var i=1;i<kS && i<=k;i++) mu[i] += S/(k*i);
+      if (kS <= k) mu[kS] += S*detLog(S/delta)/k;
+    }
+    var beta = 0;
+    for (var i=1;i<=k;i++) beta += mu[i];
+    for (var i=1;i<=k;i++) mu[i] = 0.7*mu[i]/beta;
+    var dDense = Math.min(k, 512, Math.max(8, Math.floor(k/2)));
+    mu[dDense] += 0.3;
+    var cdf = new Float64Array(k+1), acc = 0;
+    for (var i=1;i<=k;i++){ acc += mu[i]; cdf[i] = acc; }
+    cdf[k] = 1;
+    return cdf;
+  }
+  function pktRandom(sessionId, packetId){
+    var x = (sessionId ^ Math.imul(packetId + 0x9E3779B9, 0x85EBCA6B)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0;
+    x = Math.imul(x, 0x045D9F3B) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0;
+    if (x === 0) x = 0x1F123BB5;
+    return function(){
+      x = (x ^ (x << 13)) >>> 0;
+      x = (x ^ (x >>> 17)) >>> 0;
+      x = (x ^ (x << 5)) >>> 0;
+      return x;
+    };
+  }
+  function indicesForPacket(sessionId, packetId, k, cdf){
+    if (packetId < k) return [packetId]; // systematic first pass: block i verbatim
+    var rng = pktRandom(sessionId, packetId);
+    var u = rng()/4294967296;
+    var lo = 1, hi = k;
+    while (lo < hi){ var mid = (lo+hi)>>1; if (cdf[mid] < u) lo = mid+1; else hi = mid; }
+    var d = Math.min(lo, k);
+    var set = new Set();
+    var guard = 0, cap = d*20 + 1000;
+    while (set.size < d && guard++ < cap) set.add(rng() % k);
+    if (set.size < d){ for (var i=0;i<k && set.size<d;i++) set.add(i); }
+    return Array.from(set);
+  }
 
   // ---------------------------------------------------------------------
   // UI elements
@@ -10252,6 +10345,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   var logBox = document.getElementById('logBox');
   var resultPanel = document.getElementById('resultPanel');
   var downloadBtn = document.getElementById('downloadBtn');
+  var ackChk = document.getElementById('ackChk');
+  var zoomRow = document.getElementById('zoomRow');
+  var zoomSlider = document.getElementById('zoomSlider');
 
   function log(msg){
     var d = document.createElement('div');
@@ -10260,7 +10356,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     logBox.scrollTop = logBox.scrollHeight;
     while (logBox.children.length > 300) logBox.removeChild(logBox.firstChild);
   }
-
   function fmtBytes(n){
     if (n < 1024) return n+' B';
     if (n < 1024*1024) return (n/1024).toFixed(1)+' KB';
@@ -10273,41 +10368,54 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   function freshState(){
     return {
       sessionId: null, candidateSession: null, candidateCount: 0,
-      header: null,                  // {fileName, originalSize, compressedSize, blockSize, k, crcCompressed}
-      solved: new Map(),             // blockIndex -> Uint8Array
-      pivots: new Map(),             // pivotIndex -> {indices:Set, data:Uint8Array}
-      seenPacketIds: new Set(),
-      framesScanned: 0, framesDecoded: 0, framesRejected: 0, framesDuplicate: 0,
-      headerSeenAt: 0, startedAt: Date.now(), completedAt: 0, complete: false,
-      lastDegree: 0
+      meta: null,        // {k, blockSize, paddedSize, compressedSize, originalSize, crcCompressed}
+      cdf: null,
+      fileName: null,
+      solved: new Map(), // blockIndex -> row {b:Uint8Array(padded), w:Uint32Array}
+      pivots: new Map(), // pivotIndex -> {indices:Set, row}
+      seen: new Map(),   // "sid:pid" -> last-accepted timestamp (short-lived; camera dedup only)
+      framesScanned: 0, framesDecoded: 0, framesRejected: 0, framesDuplicate: 0, framesSkipped: 0,
+      lastDegree: 0,
+      startedAt: Date.now(), completedAt: 0, complete: false, finalBytes: null,
+      lastAckAt: 0, doneAcks: 0, warnedOldSender: false
     };
   }
   var S = freshState();
 
   // ---------------------------------------------------------------------
-  // Incremental GF(2) Gaussian elimination (online, echelon-form).
-  // addRow consumes & mutates the passed indicesSet/data — caller must
-  // pass fresh copies.
+  // Incremental GF(2) Gaussian elimination. Rows are 4-byte padded so the
+  // XOR hot loop runs over Uint32Array lanes (4x fewer operations).
   // ---------------------------------------------------------------------
-  function xorInto(dst, src){ for (var i=0;i<dst.length;i++) dst[i]^=src[i]; }
+  function newRow(payload, paddedSize){
+    var buf = new ArrayBuffer(paddedSize);
+    var b = new Uint8Array(buf);
+    b.set(payload);
+    return { b: b, w: new Uint32Array(buf) };
+  }
+  function xor32(dst, src){ for (var i=0;i<dst.length;i++) dst[i] ^= src[i]; }
+  function minOf(set){
+    var m = Infinity;
+    set.forEach(function(v){ if (v < m) m = v; });
+    return m;
+  }
 
   function cascade(queue){
     while (queue.length){
       var idx = queue.shift();
       var val = S.solved.get(idx);
       var toDelete = [];
-      S.pivots.forEach(function(row, key){
-        if (row.indices.has(idx)){
-          row.indices.delete(idx);
-          xorInto(row.data, val);
-          if (row.indices.size === 1){
-            var only = row.indices.values().next().value;
+      S.pivots.forEach(function(entry, key){
+        if (entry.indices.has(idx)){
+          entry.indices.delete(idx);
+          xor32(entry.row.w, val.w);
+          if (entry.indices.size === 1){
+            var only = entry.indices.values().next().value;
             if (!S.solved.has(only)){
-              S.solved.set(only, row.data);
+              S.solved.set(only, entry.row);
               toDelete.push(key);
               queue.push(only);
             }
-          } else if (row.indices.size === 0){
+          } else if (entry.indices.size === 0){
             toDelete.push(key);
           }
         }
@@ -10316,28 +10424,28 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
   }
 
-  function addRow(indicesSet, data){
+  function addRow(indicesSet, row){
     indicesSet.forEach(function(idx){
-      if (S.solved.has(idx)){ xorInto(data, S.solved.get(idx)); }
+      if (S.solved.has(idx)) xor32(row.w, S.solved.get(idx).w);
     });
     Array.from(indicesSet).forEach(function(idx){
       if (S.solved.has(idx)) indicesSet.delete(idx);
     });
-    if (indicesSet.size === 0) return; // redundant row (or, rarely, corrupt — undetectable here, CRC already checked upstream)
+    if (indicesSet.size === 0) return; // redundant row
     while (true){
-      var p = Math.min.apply(null, Array.from(indicesSet));
+      var p = minOf(indicesSet);
       if (S.pivots.has(p)){
         var prow = S.pivots.get(p);
         prow.indices.forEach(function(idx){
           if (indicesSet.has(idx)) indicesSet.delete(idx); else indicesSet.add(idx);
         });
-        xorInto(data, prow.data);
+        xor32(row.w, prow.row.w);
         if (indicesSet.size === 0) return;
         continue;
       } else {
-        S.pivots.set(p, {indices: indicesSet, data: data});
+        S.pivots.set(p, {indices: indicesSet, row: row});
         if (indicesSet.size === 1){
-          S.solved.set(p, data);
+          S.solved.set(p, row);
           S.pivots.delete(p);
           cascade([p]);
         }
@@ -10347,31 +10455,49 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   }
 
   // ---------------------------------------------------------------------
-  // Packet parsing
+  // Packet parsing. Data packets are v2 (type 0x02): fixed layout with the
+  // numeric metadata piggybacked in every packet, and block indices derived
+  // locally — see the sender for the exact layout.
   // ---------------------------------------------------------------------
   function handleSessionId(sid){
     if (S.sessionId === null){ S.sessionId = sid; log('Session adopted: 0x'+sid.toString(16)+'.'); return true; }
-    if (sid === S.sessionId) { S.candidateSession=null; S.candidateCount=0; return true; }
-    // different session seen — require it to repeat a few times before we
-    // trust it (guards against a one-off camera misread flipping bits in
-    // the session id and corrupting an in-progress transfer).
+    if (sid === S.sessionId){ S.candidateSession = null; S.candidateCount = 0; return true; }
     if (S.candidateSession === sid){ S.candidateCount++; } else { S.candidateSession = sid; S.candidateCount = 1; }
     if (S.candidateCount >= 3){
       log('New session detected (0x'+sid.toString(16)+') — resetting decoder.');
       S = freshState();
       S.sessionId = sid;
+      resultPanel.style.display = 'none';
       return true;
     }
-    return false; // ignore this frame, treat as noise from the old/foreign session
+    return false;
+  }
+
+  function adoptMeta(k, blockSize, compressedSize, originalSize, crcCompressed){
+    if (!S.meta){
+      if (k < 1 || blockSize < 1 || k !== Math.max(1, Math.ceil(compressedSize/blockSize))) return false;
+      S.meta = {
+        k: k, blockSize: blockSize,
+        paddedSize: Math.ceil(blockSize/4)*4,
+        compressedSize: compressedSize, originalSize: originalSize,
+        crcCompressed: crcCompressed
+      };
+      S.cdf = buildDegreeCDF(k);
+      log('Transfer metadata: '+fmtBytes(originalSize)+' original, k='+k+', blockSize='+blockSize+'B.');
+      return true;
+    }
+    var m = S.meta;
+    return k===m.k && blockSize===m.blockSize && compressedSize===m.compressedSize &&
+           originalSize===m.originalSize && crcCompressed===m.crcCompressed;
   }
 
   function parseHeader(buf){
-    if (buf.length < 1+4+1+4+4+2+2+4+4) return false;
+    if (buf.length < 1+4+1+4+4+2+2+4+4) return 'rej';
     var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     var o = 1;
     var sid = dv.getUint32(o); o+=4;
     var nameLen = buf[o]; o+=1;
-    if (o+nameLen+4+4+2+2+4+4 > buf.length) return false;
+    if (o+nameLen+4+4+2+2+4+4 > buf.length) return 'rej';
     var nameBytes = buf.slice(o, o+nameLen); o+=nameLen;
     var originalSize = dv.getUint32(o); o+=4;
     var compressedSize = dv.getUint32(o); o+=4;
@@ -10379,127 +10505,621 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var k = dv.getUint16(o); o+=2;
     var crcCompressed = dv.getUint32(o); o+=4;
     var headerCrc = dv.getUint32(o); o+=4;
-    var computed = crc32(buf, 0, o-4);
-    if (computed !== headerCrc){ S.framesRejected++; return false; }
-    if (!handleSessionId(sid)) return false;
-    if (!S.header){
-      var fileName;
-      try { fileName = new TextDecoder().decode(nameBytes); } catch(e){ fileName = 'received_file.bin'; }
-      S.header = { fileName: fileName||'received_file.bin', originalSize, compressedSize, blockSize, k, crcCompressed };
-      S.headerSeenAt = Date.now();
-      log('Header received: "'+S.header.fileName+'", '+fmtBytes(originalSize)+', k='+k+', blockSize='+blockSize+'B.');
+    if (crc32(buf, 0, o-4) !== headerCrc) return 'rej';
+    if (!handleSessionId(sid)) return 'rej';
+    if (!adoptMeta(k, blockSize, compressedSize, originalSize, crcCompressed)) return 'rej';
+    if (!S.fileName){
+      try { S.fileName = new TextDecoder().decode(nameBytes) || 'received_file.bin'; }
+      catch(e){ S.fileName = 'received_file.bin'; }
+      log('File name received: "'+S.fileName+'".');
     }
-    return true;
+    return 'ok';
   }
 
   function parseData(buf){
-    if (buf.length < 1+4+4+1+4) return false;
+    if (buf.length < 34) return 'rej';
     var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    var o = 1;
-    var sid = dv.getUint32(o); o+=4;
-    var packetId = dv.getUint32(o); o+=4;
-    var degree = buf[o]; o+=1;
-    if (degree < 1 || degree > 60) { S.framesRejected++; return false; }
-    var idxEnd = o + degree*2;
-    if (idxEnd + 4 > buf.length) { S.framesRejected++; return false; }
-    var indices = [];
-    for (var i=0;i<degree;i++){ indices.push(dv.getUint16(o)); o+=2; }
-    var payloadLen = buf.length - o - 4;
-    if (payloadLen <= 0) { S.framesRejected++; return false; }
-    var payload = buf.slice(o, o+payloadLen); o += payloadLen;
-    var crc = dv.getUint32(o);
-    if (crc32(payload) !== crc){ S.framesRejected++; return false; }
-    if (!handleSessionId(sid)) return false;
+    var sid = dv.getUint32(1);
+    var pid = dv.getUint32(5);
+    var k = dv.getUint16(9);
+    var blockSize = dv.getUint16(11);
+    var compressedSize = dv.getUint32(13);
+    var originalSize = dv.getUint32(17);
+    var crcCompressed = dv.getUint32(21);
+    if (buf.length !== 29 + blockSize) return 'rej';
+    if (crc32(buf, 0, buf.length-4) !== dv.getUint32(buf.length-4)) return 'rej';
+    if (!handleSessionId(sid)) return 'rej';
+    if (!adoptMeta(k, blockSize, compressedSize, originalSize, crcCompressed)) return 'rej';
 
-    var dedupKey = sid+':'+packetId;
-    if (S.seenPacketIds.has(dedupKey)){ S.framesDuplicate++; return true; }
-    S.seenPacketIds.add(dedupKey);
-    if (S.seenPacketIds.size > 250000) S.seenPacketIds.clear(); // bound memory on very long sessions
+    // dedup only against the last ~1.5s (camera oversampling); older ids may
+    // legitimately reappear as targeted audio-ACK resends and redundant rows
+    // are cheap to absorb anyway.
+    var key = sid+':'+pid;
+    var now = Date.now();
+    var last = S.seen.get(key);
+    if (last !== undefined && now-last < 1500){ return 'dup'; }
+    S.seen.set(key, now);
+    if (S.seen.size > 4096){
+      S.seen.forEach(function(ts, kk){ if (now-ts > 3000) S.seen.delete(kk); });
+    }
+    if (S.complete) return 'ok';
 
-    S.lastDegree = degree;
-    addRow(new Set(indices), payload);
-    return true;
+    var indices = indicesForPacket(sid, pid, k, S.cdf);
+    S.lastDegree = indices.length;
+    addRow(new Set(indices), newRow(buf.subarray(25, 25+blockSize), S.meta.paddedSize));
+    return 'ok';
   }
 
   function handleDecodedBytes(buf){
-    S.framesScanned++;
     if (!buf || buf.length < 5){ S.framesRejected++; return; }
-    var type = buf[0];
-    var ok = false;
+    var res = 'rej';
     try {
-      if (type === 0x00) ok = parseHeader(buf);
-      else if (type === 0x01) ok = parseData(buf);
-      else { S.framesRejected++; return; }
+      if (buf[0] === 0x00) res = parseHeader(buf);
+      else if (buf[0] === 0x02) res = parseData(buf);
+      else if (buf[0] === 0x01){
+        if (!S.warnedOldSender){ S.warnedOldSender = true; log('Saw a v1 data packet — the sender page is an old version; update both files to the same version.'); }
+      }
     } catch(e){
-      S.framesRejected++; log('Parse error (ignored): '+e.message);
-      return;
+      log('Parse error (ignored): '+e.message);
     }
-    if (ok) S.framesDecoded++; else S.framesRejected++;
-    checkCompletion();
+    if (res === 'ok') S.framesDecoded++;
+    else if (res === 'dup') S.framesDuplicate++;
+    else S.framesRejected++;
+    if (res === 'ok') checkCompletion();
   }
 
   function checkCompletion(){
-    if (S.complete || !S.header) return;
-    if (S.solved.size >= S.header.k){
-      // assemble
-      var compressed = new Uint8Array(S.header.blockSize * S.header.k);
-      for (var i=0;i<S.header.k;i++){
-        var b = S.solved.get(i);
-        if (!b){ return; } // shouldn't happen if size check passed, but be defensive
-        compressed.set(b, i*S.header.blockSize);
+    if (S.complete || !S.meta) return;
+    var m = S.meta;
+    if (S.solved.size < m.k) return;
+    var compressed = new Uint8Array(m.blockSize * m.k);
+    for (var i=0;i<m.k;i++){
+      var row = S.solved.get(i);
+      if (!row) return;
+      compressed.set(row.b.subarray(0, m.blockSize), i*m.blockSize);
+    }
+    compressed = compressed.subarray(0, m.compressedSize);
+    if (crc32(compressed) !== m.crcCompressed){
+      log('CRC mismatch on reassembled payload — waiting for more frames.');
+      S.framesRejected++;
+      return;
+    }
+    var original;
+    try { original = pako.inflateRaw(compressed); }
+    catch(e){ log('Inflate failed: '+e.message+' — waiting for more frames.'); return; }
+    if (original.length !== m.originalSize){
+      log('Size mismatch after inflate ('+original.length+' vs '+m.originalSize+') — waiting for more frames.');
+      return;
+    }
+    S.complete = true;
+    S.completedAt = Date.now();
+    S.finalBytes = original;
+    log('TRANSFER COMPLETE & VERIFIED: "'+(S.fileName||'received_file.bin')+'" ('+fmtBytes(original.length)+').');
+    statusBadge.textContent = 'COMPLETE';
+    statusBadge.className = 'badge done';
+    resultPanel.style.display = 'block';
+    playChime();
+    triggerDownload();
+  }
+
+  function triggerDownload(){
+    if (!S.finalBytes) return;
+    var blob = new Blob([S.finalBytes], {type:'application/octet-stream'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = S.fileName || 'received_file.bin';
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+  }
+  downloadBtn.addEventListener('click', triggerDownload);
+
+  // ---------------------------------------------------------------------
+  // Audio: success chime + FSK ACK transmitter (speaker -> sender's mic).
+  // Same constants as the sender's demodulator. Chime notes stay below
+  // 1100 Hz so they can never be mistaken for FSK symbols.
+  // ---------------------------------------------------------------------
+  var ACKF = { SEP: 1150, PRE_A: 4700, PRE_B: 4400, TONE0: 1500, TSTEP: 180, SLOT: 0.09 };
+  var audio = { ctx: null, busyUntil: 0 };
+  function ensureAudioCtx(){
+    if (!audio.ctx){
+      try { audio.ctx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){ return null; }
+    }
+    if (audio.ctx.state === 'suspended') audio.ctx.resume().catch(function(){});
+    return audio.ctx;
+  }
+
+  function playChime(){
+    var ctx = ensureAudioCtx();
+    if (!ctx) return;
+    try {
+      var notes = [523.25, 659.25, 783.99, 1046.5];
+      for (var i=0;i<notes.length;i++){
+        var o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine'; o.frequency.value = notes[i];
+        var t = ctx.currentTime + 0.02 + i*0.12;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.3, t+0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+0.9);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(t); o.stop(t+1);
       }
-      compressed = compressed.subarray(0, S.header.compressedSize);
-      var crc = crc32(compressed);
-      if (crc !== S.header.crcCompressed){
-        log('CRC MISMATCH on reassembled compressed payload — discarding a corrupted block and waiting for more frames.');
-        // Most likely cause: an undetected collision in the GF(2) system from
-        // a CRC-valid-but-wrong packet is astronomically unlikely; far more
-        // likely is a logic edge case. We do NOT mark complete; we keep
-        // listening for more frames. If this persists, use Reset.
-        S.framesRejected++;
-        return;
+      audio.busyUntil = Math.max(audio.busyUntil, ctx.currentTime + 1.4);
+    } catch(e){}
+  }
+
+  function sendAck(bytes){
+    if (!ackChk.checked) return false;
+    var ctx = ensureAudioCtx();
+    if (!ctx) return false;
+    var now = ctx.currentTime;
+    if (now < audio.busyUntil - 0.01) return false;
+    var full = bytes.slice();
+    full.push(crc8(bytes));
+    var slots = [17,18,17,18];
+    for (var i=0;i<full.length;i++){
+      slots.push(16, (full[i]>>4)&15, 16, full[i]&15);
+    }
+    slots.push(17);
+    try {
+      var osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.type = 'sine';
+      g.gain.value = 0.0001;
+      osc.connect(g); g.connect(ctx.destination);
+      var t = now + 0.06;
+      for (var i=0;i<slots.length;i++){
+        var sym = slots[i];
+        var f = sym===16 ? ACKF.SEP : sym===17 ? ACKF.PRE_A : sym===18 ? ACKF.PRE_B : (ACKF.TONE0 + sym*ACKF.TSTEP);
+        osc.frequency.setValueAtTime(f, t);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.5, t+0.012);
+        g.gain.setValueAtTime(0.5, t+ACKF.SLOT-0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+ACKF.SLOT-0.002);
+        t += ACKF.SLOT;
       }
-      var original;
+      osc.start(now+0.05); osc.stop(t+0.05);
+      audio.busyUntil = t + 0.1;
+      return true;
+    } catch(e){ return false; }
+  }
+
+  // ACK cadence: PROGRESS (with up to 3 missing block indices) every 5s in
+  // the endgame; DONE repeated a few times after completion so the sender
+  // auto-stops even if it missed one.
+  setInterval(function(){
+    if (!ackChk.checked || S.sessionId === null) return;
+    var now = Date.now();
+    if (S.complete){
+      if (S.doneAcks < 10 && now - S.lastAckAt > 2500){
+        if (sendAck([0xD1, S.sessionId & 0xff])){ S.doneAcks++; S.lastAckAt = now; }
+      }
+    } else if (S.meta){
+      var k = S.meta.k, solved = S.solved.size;
+      if (solved >= Math.floor(k*0.85) && now - S.lastAckAt > 5000){
+        var msg = [0xA2, S.sessionId & 0xff, solved & 0xff, (solved>>8) & 0xff];
+        var added = 0;
+        for (var i=0;i<k && added<3;i++){
+          if (!S.solved.has(i)){ msg.push(i & 0xff, (i>>8) & 0xff); added++; }
+        }
+        if (sendAck(msg)) S.lastAckAt = now;
+      }
+    }
+  }, 500);
+
+  // ---------------------------------------------------------------------
+  // Screen wake lock — keep the screen (and camera) alive while scanning
+  // ---------------------------------------------------------------------
+  var wakeLock = null;
+  function acquireWakeLock(){
+    if (navigator.wakeLock && navigator.wakeLock.request){
+      navigator.wakeLock.request('screen').then(function(wl){
+        wakeLock = wl;
+        wl.addEventListener && wl.addEventListener('release', function(){ wakeLock = null; });
+      }).catch(function(){});
+    }
+  }
+  function releaseWakeLock(){
+    if (wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
+  }
+  document.addEventListener('visibilitychange', function(){
+    if (!document.hidden && stream) acquireWakeLock();
+  });
+
+  // ---------------------------------------------------------------------
+  // Decode worker. Runs jsQR (and, when verified binary-safe, the native
+  // BarcodeDetector) off the main thread. The vendored jsQR source lives in
+  // a type="text/plain" script tag and is prepended into the worker blob.
+  //
+  // jsQR path: full-frame search alternating with 2x2 quadrant sweeps until
+  // a code is found, then locked-ROI tracking — each known code region is
+  // cropped from the FULL-resolution frame (no global downscale), with a
+  // cheap 16x16 luminance signature to skip frames whose content hasn't
+  // changed since the last attempt (the sender never repeats a frame, so an
+  // unchanged region is always a stale duplicate).
+  //
+  // BarcodeDetector: starts in "probation" — runs alongside jsQR and must
+  // return byte-identical results 4 times before it takes over (Chrome's
+  // detector returns rawValue as a string; on binary-safe platforms that is
+  // a 1:1 Latin-1 mapping, on others it mangles bytes >= 0x80). Once active
+  // it decodes full frames natively, including MULTIPLE codes per frame.
+  // ---------------------------------------------------------------------
+  function decodeWorkerBody(){
+    'use strict';
+    var detector = null, detState = 'off', probMatches = 0;
+    if (typeof BarcodeDetector !== 'undefined'){
       try {
-        original = pako.inflateRaw(compressed);
-      } catch(e){
-        log('Inflate failed: '+e.message+' — waiting for more frames.');
-        return;
-      }
-      if (original.length !== S.header.originalSize){
-        log('Size mismatch after inflate ('+original.length+' vs expected '+S.header.originalSize+') — waiting for more frames.');
-        return;
-      }
-      S.complete = true;
-      S.completedAt = Date.now();
-      S.finalBytes = original;
-      log('TRANSFER COMPLETE & VERIFIED: "'+S.header.fileName+'" ('+fmtBytes(original.length)+').');
-      statusBadge.textContent = 'COMPLETE';
-      statusBadge.className = 'badge done';
-      resultPanel.style.display = 'block';
-      downloadBtn.onclick = function(){
-        var blob = new Blob([original], {type:'application/octet-stream'});
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        a.href = url; a.download = S.header.fileName || 'received_file.bin';
-        document.body.appendChild(a); a.click();
-        setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+        BarcodeDetector.getSupportedFormats().then(function(fmts){
+          if (fmts.indexOf('qr_code') >= 0){
+            detector = new BarcodeDetector({formats:['qr_code']});
+            detState = 'probation';
+            postMessage({type:'log', msg:'Native BarcodeDetector found — verifying it decodes binary safely…'});
+          }
+        }).catch(function(){});
+      } catch(e){}
+    }
+
+    var cv = null, cx = null, rc = null, rcx = null;
+    var mode = 'search', flip = false, boxes = [], frameNo = 0;
+    var GROW = 0.35;
+
+    self.onmessage = function(ev){
+      var d = ev.data;
+      if (d.type !== 'frame') return;
+      handleFrame(d.bitmap);
+    };
+
+    function handleFrame(bm){
+      frameNo++;
+      var skipped = {n:0}, results = [];
+      var finish = function(){
+        var payload = results.map(function(r){ return {bytes:r.bytes.buffer, corners:r.corners}; });
+        var transfer = results.map(function(r){ return r.bytes.buffer; });
+        postMessage({type:'frame', results:payload, skipped:skipped.n, native:detState==='active'}, transfer);
       };
+      try {
+        var W = bm.width, H = bm.height;
+        if (!cv || cv.width !== W || cv.height !== H){
+          cv = new OffscreenCanvas(W, H);
+          cx = cv.getContext('2d', {willReadFrequently:true});
+        }
+        cx.drawImage(bm, 0, 0);
+        bm.close();
+        if (detState === 'active'){
+          nativeDetect().then(function(nat){ results = nat; finish(); }, finish);
+          return;
+        }
+        if (detState === 'probation'){
+          var js = jsqrPass(W, H, skipped);
+          nativeDetect().then(function(nat){
+            if (js.length && nat.length){
+              var eq = nat.some(function(n){ return bytesEq(n.bytes, js[0].bytes); });
+              if (eq){
+                if (++probMatches >= 4){
+                  detState = 'active';
+                  postMessage({type:'log', msg:'Native decoder verified binary-safe — switching to hardware QR decoding (multi-code capable).'});
+                }
+              } else {
+                detState = 'off'; detector = null;
+                postMessage({type:'log', msg:'Native decoder mangles binary payloads on this platform — staying on jsQR.'});
+              }
+            }
+            results = js; finish();
+          }, function(){ results = js; finish(); });
+          return;
+        }
+        results = jsqrPass(W, H, skipped);
+        finish();
+      } catch(e){
+        finish();
+      }
+    }
+
+    function nativeDetect(){
+      return detector.detect(cv).then(function(codes){
+        var out = [];
+        for (var ci=0;ci<codes.length;ci++){
+          var s = codes[ci].rawValue, ok = true;
+          var b = new Uint8Array(s.length);
+          for (var i=0;i<s.length;i++){
+            var cc = s.charCodeAt(i);
+            if (cc > 255){ ok = false; break; }
+            b[i] = cc;
+          }
+          if (ok && b.length){
+            var cp = codes[ci].cornerPoints || [];
+            out.push({bytes:b, corners:cp.map(function(p){ return {x:p.x, y:p.y}; })});
+          }
+        }
+        return out;
+      });
+    }
+    function bytesEq(a, b){
+      if (a.length !== b.length) return false;
+      for (var i=0;i<a.length;i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
+
+    function sigOf(img){
+      var N = 16, out = new Uint8Array(N*N), d = img.data, w = img.width, h = img.height;
+      for (var j=0;j<N;j++){
+        for (var i=0;i<N;i++){
+          var x = Math.floor((i+0.5)*w/N), y = Math.floor((j+0.5)*h/N);
+          out[j*N+i] = d[(y*w+x)*4+1];
+        }
+      }
+      return out;
+    }
+    function sigDiff(a, b){
+      if (!a || !b || a.length !== b.length) return 255;
+      var s = 0;
+      for (var i=0;i<a.length;i++) s += Math.abs(a[i]-b[i]);
+      return s/a.length;
+    }
+    function grow(b, f){
+      var gx = b.w*f, gy = b.h*f;
+      return {x:b.x-gx, y:b.y-gy, w:b.w+2*gx, h:b.h+2*gy};
+    }
+
+    function scanRegion(sx, sy, sw, sh, maxDim, prevSig){
+      sx = Math.max(0, Math.floor(sx)); sy = Math.max(0, Math.floor(sy));
+      sw = Math.min(cv.width-sx, Math.ceil(sw)); sh = Math.min(cv.height-sy, Math.ceil(sh));
+      if (sw < 32 || sh < 32) return {r:null, sig:null, skip:false};
+      var sc = Math.min(1, maxDim/Math.max(sw, sh));
+      var w = Math.max(1, Math.round(sw*sc)), h = Math.max(1, Math.round(sh*sc));
+      if (!rc || rc.width < w || rc.height < h){
+        rc = new OffscreenCanvas(Math.max(w,64), Math.max(h,64));
+        rcx = rc.getContext('2d', {willReadFrequently:true});
+      }
+      rcx.drawImage(cv, sx, sy, sw, sh, 0, 0, w, h);
+      var img = rcx.getImageData(0, 0, w, h);
+      var sig = sigOf(img);
+      if (prevSig && sigDiff(sig, prevSig) < 5) return {r:null, sig:sig, skip:true};
+      var r = null;
+      try { r = jsQR(img.data, w, h, {inversionAttempts:'dontInvert'}); } catch(e){}
+      if (r && r.binaryData && r.binaryData.length){
+        var inv = 1/sc;
+        var map = function(p){ return {x:sx+p.x*inv, y:sy+p.y*inv}; };
+        var cs = [map(r.location.topLeftCorner), map(r.location.topRightCorner),
+                  map(r.location.bottomRightCorner), map(r.location.bottomLeftCorner)];
+        var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (var i=0;i<4;i++){
+          if (cs[i].x < minX) minX = cs[i].x;
+          if (cs[i].x > maxX) maxX = cs[i].x;
+          if (cs[i].y < minY) minY = cs[i].y;
+          if (cs[i].y > maxY) maxY = cs[i].y;
+        }
+        return {r:{bytes:new Uint8Array(r.binaryData), corners:cs,
+                   box:{x:minX, y:minY, w:maxX-minX, h:maxY-minY}}, sig:sig, skip:false};
+      }
+      return {r:null, sig:sig, skip:false};
+    }
+
+    function quadrants(W, H){
+      var w = W*0.58, h = H*0.58;
+      return [[0,0,w,h],[W-w,0,w,h],[0,H-h,w,h],[W-w,H-h,w,h]];
+    }
+    function boxNear(nb){
+      var ncx = nb.x+nb.w/2, ncy = nb.y+nb.h/2;
+      return boxes.some(function(b){
+        return Math.abs(b.box.x+b.box.w/2-ncx) < nb.w/2 && Math.abs(b.box.y+b.box.h/2-ncy) < nb.h/2;
+      });
+    }
+
+    function jsqrPass(W, H, skipped){
+      var found = [];
+      if (mode === 'search'){
+        flip = !flip;
+        if (flip){
+          var res = scanRegion(0, 0, W, H, 900, null);
+          if (res.r) found.push(res.r);
+        } else {
+          var qs = quadrants(W, H);
+          for (var i=0;i<qs.length;i++){
+            var res2 = scanRegion(qs[i][0], qs[i][1], qs[i][2], qs[i][3], 700, null);
+            if (res2.r) found.push(res2.r);
+          }
+        }
+        if (found.length){
+          boxes = found.map(function(f){ return {box:grow(f.box, GROW), miss:0, sig:null}; });
+          mode = 'locked';
+        }
+      } else {
+        for (var i=0;i<boxes.length;i++){
+          var bx = boxes[i], b = bx.box;
+          var res3 = scanRegion(b.x, b.y, b.w, b.h, 720, bx.sig);
+          bx.sig = res3.sig;
+          if (res3.skip){ skipped.n++; continue; }
+          if (res3.r){
+            bx.box = grow(res3.r.box, GROW);
+            bx.miss = 0;
+            found.push(res3.r);
+          } else bx.miss++;
+        }
+        boxes = boxes.filter(function(b){ return b.miss < 25; });
+        if (!boxes.length) mode = 'search';
+        else if (boxes.length < 4 && frameNo % 15 === 0){
+          // periodic sweep: discover additional grid cells / re-center drift
+          var qs2 = quadrants(W, H);
+          for (var i=0;i<qs2.length;i++){
+            var res4 = scanRegion(qs2[i][0], qs2[i][1], qs2[i][2], qs2[i][3], 700, null);
+            if (res4.r){
+              found.push(res4.r);
+              var nb = grow(res4.r.box, GROW);
+              if (!boxNear(nb)) boxes.push({box:nb, miss:0, sig:null});
+            }
+          }
+        }
+      }
+      return found;
+    }
+  }
+
+  var worker = null;
+  var usingWorker = false;
+  if (window.Worker && window.OffscreenCanvas && window.createImageBitmap){
+    try {
+      var src = jsqrSrcEl.textContent + '\n(' + decodeWorkerBody.toString() + ')();';
+      worker = new Worker(URL.createObjectURL(new Blob([src], {type:'application/javascript'})));
+      worker.onmessage = onWorkerMsg;
+      worker.onerror = function(e){
+        log('Decode worker failed ('+(e.message||'unknown')+') — falling back to main-thread decoding.');
+        try { worker.terminate(); } catch(err){}
+        worker = null; usingWorker = false; busy = false;
+        ensureMainThreadJsQR();
+      };
+      usingWorker = true;
+    } catch(e){ worker = null; }
+  }
+  function ensureMainThreadJsQR(){
+    if (typeof window.jsQR === 'undefined'){
+      (0, eval)(jsqrSrcEl.textContent);
+    }
+  }
+  if (!usingWorker) ensureMainThreadJsQR();
+
+  // ---------------------------------------------------------------------
+  // Camera + capture pump. requestVideoFrameCallback fires exactly once per
+  // NEW camera frame (rAF fallback), and only one frame is in flight at a
+  // time — natural backpressure instead of decoding stale frames.
+  // ---------------------------------------------------------------------
+  var stream = null, busy = false, pumping = false;
+  var scanCanvas = document.createElement('canvas');
+  var sctx = scanCanvas.getContext('2d', {willReadFrequently:true});
+  var mtSig = null, mtFlip = false;
+
+  function onWorkerMsg(ev){
+    var d = ev.data;
+    if (d.type === 'log'){ log(d.msg); return; }
+    if (d.type !== 'frame') return;
+    busy = false;
+    S.framesScanned++;
+    S.framesSkipped += d.skipped || 0;
+    decoderLabel = d.native ? 'native (BarcodeDetector, worker)' : 'jsQR (worker)';
+    var rs = d.results || [];
+    drawOverlayMulti(rs);
+    for (var i=0;i<rs.length;i++){
+      handleDecodedBytes(new Uint8Array(rs[i].bytes));
+    }
+  }
+
+  function captureFrame(){
+    if (busy || !video.videoWidth || video.readyState < 2) return;
+    if (usingWorker && worker){
+      busy = true;
+      createImageBitmap(video).then(function(bm){
+        if (worker){ worker.postMessage({type:'frame', bitmap:bm}, [bm]); }
+        else { busy = false; bm.close(); }
+      }).catch(function(){ busy = false; });
+    } else {
+      mainThreadScan();
+    }
+  }
+
+  function mainThreadScan(){
+    var w = video.videoWidth, h = video.videoHeight;
+    var maxDim = 900;
+    var scale = Math.min(1, maxDim/Math.max(w, h));
+    var cw = Math.round(w*scale), ch = Math.round(h*scale);
+    if (scanCanvas.width !== cw || scanCanvas.height !== ch){ scanCanvas.width = cw; scanCanvas.height = ch; }
+    sctx.drawImage(video, 0, 0, cw, ch);
+    var imgData;
+    try { imgData = sctx.getImageData(0, 0, cw, ch); } catch(e){ return; }
+    // identical-frame skip (16x16 luminance signature)
+    var N = 16, sig = new Uint8Array(N*N);
+    for (var j=0;j<N;j++){
+      for (var i=0;i<N;i++){
+        var x = Math.floor((i+0.5)*cw/N), y = Math.floor((j+0.5)*ch/N);
+        sig[j*N+i] = imgData.data[(y*cw+x)*4+1];
+      }
+    }
+    if (mtSig){
+      var s = 0;
+      for (var i=0;i<sig.length;i++) s += Math.abs(sig[i]-mtSig[i]);
+      if (s/sig.length < 5){ mtSig = sig; S.framesScanned++; S.framesSkipped++; return; }
+    }
+    mtSig = sig;
+    S.framesScanned++;
+    var results = [];
+    mtFlip = !mtFlip;
+    if (mtFlip){
+      var r = null;
+      try { r = jsQR(imgData.data, cw, ch, {inversionAttempts:'dontInvert'}); } catch(e){}
+      if (r && r.binaryData && r.binaryData.length){
+        var L = r.location, inv = 1/scale;
+        results.push({bytes:new Uint8Array(r.binaryData).buffer, corners:[
+          {x:L.topLeftCorner.x*inv, y:L.topLeftCorner.y*inv},
+          {x:L.topRightCorner.x*inv, y:L.topRightCorner.y*inv},
+          {x:L.bottomRightCorner.x*inv, y:L.bottomRightCorner.y*inv},
+          {x:L.bottomLeftCorner.x*inv, y:L.bottomLeftCorner.y*inv}]});
+      }
+    } else {
+      // quadrant pass so 2x2 sender grids still work without the worker
+      var qw = Math.round(cw*0.58), qh = Math.round(ch*0.58);
+      var qs = [[0,0],[cw-qw,0],[0,ch-qh],[cw-qw,ch-qh]];
+      for (var qi=0;qi<qs.length;qi++){
+        var qImg;
+        try { qImg = sctx.getImageData(qs[qi][0], qs[qi][1], qw, qh); } catch(e){ continue; }
+        var qr = null;
+        try { qr = jsQR(qImg.data, qw, qh, {inversionAttempts:'dontInvert'}); } catch(e){}
+        if (qr && qr.binaryData && qr.binaryData.length){
+          var QL = qr.location, inv2 = 1/scale;
+          results.push({bytes:new Uint8Array(qr.binaryData).buffer, corners:[
+            {x:(qs[qi][0]+QL.topLeftCorner.x)*inv2, y:(qs[qi][1]+QL.topLeftCorner.y)*inv2},
+            {x:(qs[qi][0]+QL.topRightCorner.x)*inv2, y:(qs[qi][1]+QL.topRightCorner.y)*inv2},
+            {x:(qs[qi][0]+QL.bottomRightCorner.x)*inv2, y:(qs[qi][1]+QL.bottomRightCorner.y)*inv2},
+            {x:(qs[qi][0]+QL.bottomLeftCorner.x)*inv2, y:(qs[qi][1]+QL.bottomLeftCorner.y)*inv2}]});
+        }
+      }
+    }
+    decoderLabel = 'jsQR (main thread)';
+    drawOverlayMulti(results);
+    for (var i=0;i<results.length;i++) handleDecodedBytes(new Uint8Array(results[i].bytes));
+  }
+
+  var pumpId = 0; // invalidates any in-flight callback chain on stop/camera switch
+  function pump(){
+    if (!stream || !pumping) return;
+    var id = pumpId;
+    var next = function(){
+      if (id !== pumpId) return;
+      captureFrame();
+      pump();
+    };
+    if (video.requestVideoFrameCallback){
+      video.requestVideoFrameCallback(function(){ next(); });
+    } else {
+      requestAnimationFrame(function(){ next(); });
+    }
+  }
+
+  function drawOverlayMulti(results){
+    overlay.width = video.clientWidth; overlay.height = video.clientHeight;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!results || !results.length || !video.videoWidth) return;
+    var sx = overlay.width/video.videoWidth, sy = overlay.height/video.videoHeight;
+    octx.strokeStyle = '#4dd0a8';
+    octx.lineWidth = 3;
+    for (var i=0;i<results.length;i++){
+      var cs = results[i].corners;
+      if (!cs || cs.length < 4) continue;
+      octx.beginPath();
+      octx.moveTo(cs[0].x*sx, cs[0].y*sy);
+      for (var j=1;j<4;j++) octx.lineTo(cs[j].x*sx, cs[j].y*sy);
+      octx.closePath();
+      octx.stroke();
     }
   }
 
   // ---------------------------------------------------------------------
-  // Camera + scan loop
+  // Camera control
   // ---------------------------------------------------------------------
-  var stream = null, scanCanvas = document.createElement('canvas'), sctx = scanCanvas.getContext('2d', {willReadFrequently:true});
-  var rafId = null;
-  var lastDecodeOkAt = 0;
+  var decoderLabel = usingWorker ? 'worker starting…' : 'jsQR (main thread)';
 
   function listCameras(){
     if (!navigator.mediaDevices.enumerateDevices) return;
     navigator.mediaDevices.enumerateDevices().then(function(devices){
       var cams = devices.filter(function(d){ return d.kind === 'videoinput'; });
       if (!cams.length) return;
+      var current = cameraSel.value;
       cameraSel.innerHTML = '';
       cams.forEach(function(c, i){
         var opt = document.createElement('option');
@@ -10507,86 +11127,83 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         opt.textContent = c.label || ('Camera '+(i+1));
         cameraSel.appendChild(opt);
       });
-      // prefer a "back"/"rear"/"environment" labelled camera by default
+      var restored = false;
       for (var i=0;i<cameraSel.options.length;i++){
-        var t = cameraSel.options[i].textContent.toLowerCase();
-        if (t.indexOf('back')>=0 || t.indexOf('rear')>=0 || t.indexOf('environment')>=0){
-          cameraSel.selectedIndex = i; break;
+        if (cameraSel.options[i].value === current){ cameraSel.selectedIndex = i; restored = true; break; }
+      }
+      if (!restored){
+        for (var i=0;i<cameraSel.options.length;i++){
+          var t = cameraSel.options[i].textContent.toLowerCase();
+          if (t.indexOf('back')>=0 || t.indexOf('rear')>=0 || t.indexOf('environment')>=0){
+            cameraSel.selectedIndex = i; break;
+          }
         }
       }
     }).catch(function(){});
   }
 
   function startCamera(){
-    var constraints = { video: { facingMode: {ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} }, audio:false };
+    var base = { width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60} };
+    var constraints = { video: Object.assign({facingMode:{ideal:'environment'}}, base), audio:false };
     var deviceId = cameraSel.value;
-    if (deviceId && deviceId !== 'Default camera') constraints.video = { deviceId:{exact:deviceId}, width:{ideal:1280}, height:{ideal:720} };
+    if (deviceId && deviceId !== 'Default camera'){
+      constraints.video = Object.assign({deviceId:{exact:deviceId}}, base);
+    }
     return navigator.mediaDevices.getUserMedia(constraints).then(function(s){
       stream = s;
       video.srcObject = s;
+      setupTrackControls(s);
       return video.play();
     });
   }
 
-  function stopCamera(){
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = null;
-    if (stream){ stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
-  }
-
-  function scanLoop(){
-    if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0){
-      var w = video.videoWidth, h = video.videoHeight;
-      // downscale very large camera frames for decode speed; jsQR works fine
-      // on modest resolutions and this keeps CPU/battery usage reasonable.
-      var maxDim = 900;
-      var scale = Math.min(1, maxDim/Math.max(w,h));
-      var cw = Math.round(w*scale), ch = Math.round(h*scale);
-      if (scanCanvas.width !== cw || scanCanvas.height !== ch){ scanCanvas.width=cw; scanCanvas.height=ch; }
-      sctx.drawImage(video, 0, 0, cw, ch);
-      var imgData;
-      try { imgData = sctx.getImageData(0,0,cw,ch); }
-      catch(e){ rafId = requestAnimationFrame(scanLoop); return; }
-      var result = null;
-      try { result = jsQR(imgData.data, cw, ch, {inversionAttempts:'dontInvert'}); }
-      catch(e){ /* malformed frame, ignore */ }
-      drawOverlay(result, cw, ch);
-      if (result && result.binaryData && result.binaryData.length){
-        lastDecodeOkAt = Date.now();
-        handleDecodedBytes(new Uint8Array(result.binaryData));
+  function setupTrackControls(s){
+    var track = s.getVideoTracks()[0];
+    if (!track || !track.getCapabilities) return;
+    try {
+      var caps = track.getCapabilities();
+      if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0){
+        track.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(function(){});
       }
-    }
-    rafId = requestAnimationFrame(scanLoop);
+      if (caps.zoom && caps.zoom.max > caps.zoom.min){
+        zoomRow.style.display = 'block';
+        zoomSlider.min = caps.zoom.min;
+        zoomSlider.max = caps.zoom.max;
+        zoomSlider.step = caps.zoom.step || 0.1;
+        zoomSlider.value = track.getSettings().zoom || caps.zoom.min;
+        zoomSlider.oninput = function(){
+          track.applyConstraints({advanced:[{zoom:parseFloat(zoomSlider.value)}]}).catch(function(){});
+        };
+      } else {
+        zoomRow.style.display = 'none';
+      }
+      var st = track.getSettings();
+      log('Camera: '+st.width+'x'+st.height+'@'+(st.frameRate ? Math.round(st.frameRate) : '?')+'fps.');
+    } catch(e){}
   }
 
-  function drawOverlay(result, cw, ch){
-    overlay.width = video.clientWidth; overlay.height = video.clientHeight;
-    octx.clearRect(0,0,overlay.width, overlay.height);
-    if (!result) return;
-    var sx = overlay.width/cw, sy = overlay.height/ch;
-    var loc = result.location;
-    octx.strokeStyle = '#4dd0a8';
-    octx.lineWidth = 3;
-    octx.beginPath();
-    octx.moveTo(loc.topLeftCorner.x*sx, loc.topLeftCorner.y*sy);
-    octx.lineTo(loc.topRightCorner.x*sx, loc.topRightCorner.y*sy);
-    octx.lineTo(loc.bottomRightCorner.x*sx, loc.bottomRightCorner.y*sy);
-    octx.lineTo(loc.bottomLeftCorner.x*sx, loc.bottomLeftCorner.y*sy);
-    octx.closePath();
-    octx.stroke();
+  function stopCamera(){
+    pumping = false;
+    pumpId++;
+    busy = false;
+    if (stream){ stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
+    releaseWakeLock();
   }
 
   startBtn.addEventListener('click', function(){
     startBtn.disabled = true;
     statusBadge.textContent = 'REQUESTING CAMERA…';
     statusBadge.className = 'badge run';
+    ensureAudioCtx(); // unlock audio for the chime / ACKs while we have a user gesture
     startCamera().then(function(){
       permHint.textContent = '';
       statusBadge.textContent = 'SCANNING';
       stopBtn.disabled = false;
       listCameras();
-      rafId = requestAnimationFrame(scanLoop);
-      log('Camera started. Scanning…');
+      pumping = true;
+      pump();
+      acquireWakeLock();
+      log('Camera started. Scanning… (decoder: '+decoderLabel+')');
     }).catch(function(err){
       statusBadge.textContent = 'CAMERA ERROR';
       statusBadge.className = 'badge err';
@@ -10616,10 +11233,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   });
 
   cameraSel.addEventListener('change', function(){
-    if (stream){ stopCamera(); startCamera().then(function(){ rafId = requestAnimationFrame(scanLoop); }); }
+    if (stream){
+      stopCamera();
+      startCamera().then(function(){ pumping = true; pump(); acquireWakeLock(); }).catch(function(err){
+        log('Camera switch failed: '+err.message);
+      });
+    }
   });
 
-  // initial device list (labels may be empty until permission granted once)
   if (navigator.mediaDevices.enumerateDevices) listCameras();
   navigator.mediaDevices.addEventListener && navigator.mediaDevices.addEventListener('devicechange', listCameras);
 
@@ -10627,34 +11248,37 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   // Stats / progress rendering
   // ---------------------------------------------------------------------
   function renderStats(){
-    var k = S.header ? S.header.k : 0;
+    var k = S.meta ? S.meta.k : 0;
     var solved = S.solved.size;
     var frac = k ? solved/k : 0;
     progEl.value = frac;
-    if (!S.header){
-      progLabel.textContent = 'Waiting for header frame… ('+S.framesScanned+' frames scanned)';
+    if (!S.meta){
+      progLabel.textContent = 'Waiting for first packet… ('+S.framesScanned+' camera frames processed)';
     } else if (!S.complete){
       progLabel.textContent = solved+' / '+k+' blocks recovered ('+(frac*100).toFixed(1)+'%)';
     } else {
-      progLabel.textContent = 'Done — '+fmtBytes(S.finalBytes.length)+' reconstructed and CRC-verified.';
+      progLabel.textContent = 'Done — '+fmtBytes(S.finalBytes.length)+' reconstructed, CRC-verified and downloaded.';
     }
-    var elapsed = (( S.complete ? S.completedAt : Date.now()) - S.startedAt)/1000;
-    var bytesRecovered = S.header ? solved*S.header.blockSize : 0;
+    var elapsed = ((S.complete ? S.completedAt : Date.now()) - S.startedAt)/1000;
+    var bytesRecovered = S.meta ? solved*S.meta.blockSize : 0;
     var throughput = elapsed>0 ? bytesRecovered/elapsed : 0;
     var rows = [
-      ['File', S.header ? S.header.fileName : '—'],
-      ['Expected size', S.header ? fmtBytes(S.header.originalSize) : '—'],
-      ['Compressed size', S.header ? fmtBytes(S.header.compressedSize) : '—'],
+      ['File', S.fileName || (S.meta ? 'received_file.bin (name pending)' : '—')],
+      ['Expected size', S.meta ? fmtBytes(S.meta.originalSize) : '—'],
+      ['Compressed size', S.meta ? fmtBytes(S.meta.compressedSize) : '—'],
       ['Blocks (k)', k || '—'],
-      ['Block size', S.header ? S.header.blockSize+' B' : '—'],
+      ['Block size', S.meta ? S.meta.blockSize+' B' : '—'],
       ['Session ID', S.sessionId!==null ? ('0x'+S.sessionId.toString(16)) : '—'],
+      ['Decoder', decoderLabel],
       ['Blocks solved', solved+' / '+(k||'?')],
       ['Pending equations', S.pivots.size],
-      ['Frames scanned (camera)', S.framesScanned],
-      ['Frames decoded OK', S.framesDecoded],
-      ['Frames rejected (bad CRC/garbage)', S.framesRejected],
-      ['Duplicate frames skipped', S.framesDuplicate],
+      ['Camera frames processed', S.framesScanned],
+      ['Identical frames skipped', S.framesSkipped],
+      ['Packets decoded OK', S.framesDecoded],
+      ['Packets rejected (bad CRC/garbage)', S.framesRejected],
+      ['Duplicate packets skipped', S.framesDuplicate],
       ['Last packet degree', S.lastDegree],
+      ['Audio ACKs', ackChk.checked ? (S.complete ? 'sending DONE' : 'enabled') : 'off'],
       ['Elapsed', elapsed.toFixed(1)+' s'],
       ['Effective throughput', fmtBytes(throughput)+'/s']
     ];
@@ -10666,7 +11290,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   renderStats();
   log('Ready. Point the camera at the sender\'s screen and tap "Start Scanning".');
 })();
-
 </script>
 </body>
 </html>

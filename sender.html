@@ -55,10 +55,18 @@
       <div>
         <label>Frame interval</label>
         <select id="interval">
-          <option value="100">100 ms (~10 fps)</option>
-          <option value="150" selected>150 ms (~6.6 fps)</option>
-          <option value="220">220 ms (~4.5 fps)</option>
-          <option value="350">350 ms (~3 fps)</option>
+          <option value="50">50 ms (20 QR/s)</option>
+          <option value="66">66 ms (15 QR/s)</option>
+          <option value="100" selected>100 ms (10 QR/s)</option>
+          <option value="150">150 ms (6.6 QR/s)</option>
+          <option value="250">250 ms (4 QR/s)</option>
+        </select>
+      </div>
+      <div>
+        <label>Codes per frame</label>
+        <select id="gridSel">
+          <option value="1" selected>1 (single QR)</option>
+          <option value="2">4 (2&times;2 grid)</option>
         </select>
       </div>
     </div>
@@ -66,16 +74,18 @@
       <button class="primary" id="startBtn" disabled>Start Broadcasting</button>
       <button id="stopBtn" disabled>Stop</button>
       <button class="danger" id="resetBtn">New Transfer</button>
+      <button id="micBtn">Enable ACK Mic</button>
+      <button id="fsBtn">Fullscreen</button>
       <span id="statusBadge" class="badge idle">IDLE</span>
     </div>
     <div class="hint" id="fileInfo" style="margin-top:8px;">No file selected.</div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="stagePanel">
     <div class="stage">
       <canvas id="qrCanvas" width="10" height="10"></canvas>
       <progress id="prog" value="0" max="1"></progress>
-      <div class="hint">Point the receiver's camera at this screen. Keep this tab in the foreground. The frame stream loops forever — stop manually once the receiver shows 100%.</div>
+      <div class="hint">Point the receiver's camera at this screen and keep this tab in the foreground. The stream sends every block once, then repairs losses forever — stop manually when the receiver shows 100%, or enable the ACK mic and it stops by itself when the receiver plays its audio acknowledgement.</div>
     </div>
   </div>
 
@@ -93,10 +103,16 @@
 /* =========================================================================
    AIRGAP QR SENDER
    Single-file, offline-capable. No network calls at runtime.
-   Pipeline: file -> deflate (pako) -> split into k fixed-size blocks ->
-   robust-soliton fountain encoding -> each encoded packet rendered as a
-   QR code (byte mode, explicit-index packets, CRC32-protected) -> displayed
-   on a loop until the operator stops it.
+   Pipeline (protocol v2): file -> deflate (native CompressionStream when
+   available, pako fallback) -> split into k fixed-size blocks -> systematic
+   pass (every block once, verbatim) followed by fountain-coded repair
+   packets whose block indices are DERIVED on both ends from (sessionId,
+   packetId, k) via a shared deterministic PRNG (nothing but the packet id
+   travels over the wire) -> rendered as 1 or 4 QR codes per display frame,
+   vsync-paced, with an alternating beacon bar so the receiver can skip
+   stale frames. Optional audio ACK back-channel: the receiver's speaker
+   sends FSK progress/done messages that this page's microphone decodes to
+   prioritize resends and auto-stop.
    ========================================================================= */
 </script>
 
@@ -2453,54 +2469,107 @@ var qrcode = function() {
     for (var i=start;i<end;i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
     return (crc ^ 0xFFFFFFFF) >>> 0;
   }
+  function crc8(bytes){
+    var c = 0;
+    for (var i=0;i<bytes.length;i++){
+      c ^= bytes[i];
+      for (var b=0;b<8;b++) c = (c & 0x80) ? ((c<<1)^0x07)&0xff : (c<<1)&0xff;
+    }
+    return c;
+  }
 
   // ---------------------------------------------------------------------
-  // Robust Soliton degree distribution (LT fountain code)
+  // Deterministic fountain-code degree distribution + per-packet PRNG.
+  // Both files (sender/receiver) carry IDENTICAL copies of these three
+  // functions: the receiver re-derives each packet's block indices from
+  // (sessionId, packetId, k) alone, so nothing but the packet id travels
+  // over the wire. Only IEEE-754 correctly-rounded ops are used (+,-,*,/,
+  // sqrt, floor, Math.imul) — NO Math.log/pow — so every JS engine
+  // computes bit-identical results.
   // ---------------------------------------------------------------------
-  function buildSolitonCDF(k){
+  function detLog(x){
+    // natural log via atanh series with a fixed iteration count. Every op is
+    // IEEE-754 correctly-rounded, so the result is bit-identical on all JS
+    // engines (Math.log is NOT guaranteed to be, and any divergence between
+    // sender and receiver would corrupt the derived packet indices).
+    var e = 0;
+    while (x >= 2){ x /= 2; e++; }
+    while (x < 1){ x *= 2; e--; }
+    var t = (x-1)/(x+1), t2 = t*t, sum = 0, term = t;
+    for (var n=1;n<=19;n+=2){ sum += term/n; term *= t2; }
+    return 2*sum + e*0.6931471805599453;
+  }
+  function buildDegreeCDF(k){
+    // Robust soliton (c=0.1, delta=0.05) carrying 70% of the mass, plus a
+    // 30% "dense row" component at degree ~min(k/2, 512). The receiver does
+    // full Gaussian elimination (not just peeling), and dense rows are far
+    // more likely to be linearly independent in the endgame — this cuts the
+    // fountain reception overhead to roughly 10%.
     if (k < 1) k = 1;
+    var mu = new Float64Array(k+1);
+    mu[1] = 1/k;
+    for (var i=2;i<=k;i++) mu[i] = 1/(i*(i-1));
     var c = 0.1, delta = 0.05;
-    var rho = new Float64Array(k+1);
-    rho[1] = 1/k;
-    for (var i=2;i<=k;i++) rho[i] = 1/(i*(i-1));
-    var S = Math.max(1, c*Math.log(k/delta)*Math.sqrt(k));
-    var tau = new Float64Array(k+1);
+    var S = c*detLog(k/delta)*Math.sqrt(k);
+    if (S < 1) S = 1;
     var kS = Math.floor(k/S);
-    for (var i=1;i<=Math.max(1,kS-1);i++) tau[i] = S/(k*i);
-    if (kS>=1 && kS<=k) tau[kS] += S*Math.log(S/delta)/k;
-    var mu = new Float64Array(k+1), beta=0;
-    for (var i=1;i<=k;i++){ mu[i]=rho[i]+tau[i]; beta+=mu[i]; }
-    var cdf = new Float64Array(k+1), acc=0;
-    for (var i=1;i<=k;i++){ acc += mu[i]/beta; cdf[i]=acc; }
+    if (kS >= 1){
+      for (var i=1;i<kS && i<=k;i++) mu[i] += S/(k*i);
+      if (kS <= k) mu[kS] += S*detLog(S/delta)/k;
+    }
+    var beta = 0;
+    for (var i=1;i<=k;i++) beta += mu[i];
+    for (var i=1;i<=k;i++) mu[i] = 0.7*mu[i]/beta;
+    var dDense = Math.min(k, 512, Math.max(8, Math.floor(k/2)));
+    mu[dDense] += 0.3;
+    var cdf = new Float64Array(k+1), acc = 0;
+    for (var i=1;i<=k;i++){ acc += mu[i]; cdf[i] = acc; }
     cdf[k] = 1;
     return cdf;
   }
-  function sampleDegree(cdf, k){
-    var u = Math.random();
-    var lo=1, hi=k;
-    while (lo<hi){ var mid=(lo+hi)>>1; if (cdf[mid] < u) lo=mid+1; else hi=mid; }
-    return lo;
+  function pktRandom(sessionId, packetId){
+    var x = (sessionId ^ Math.imul(packetId + 0x9E3779B9, 0x85EBCA6B)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0;
+    x = Math.imul(x, 0x045D9F3B) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0;
+    if (x === 0) x = 0x1F123BB5;
+    return function(){
+      x = (x ^ (x << 13)) >>> 0;
+      x = (x ^ (x >>> 17)) >>> 0;
+      x = (x ^ (x << 5)) >>> 0;
+      return x;
+    };
   }
-  function pickIndices(d, k){
-    d = Math.min(d, k);
+  function indicesForPacket(sessionId, packetId, k, cdf){
+    if (packetId < k) return [packetId]; // systematic first pass: block i verbatim
+    var rng = pktRandom(sessionId, packetId);
+    var u = rng()/4294967296;
+    var lo = 1, hi = k;
+    while (lo < hi){ var mid = (lo+hi)>>1; if (cdf[mid] < u) lo = mid+1; else hi = mid; }
+    var d = Math.min(lo, k);
     var set = new Set();
-    while (set.size < d) set.add(Math.floor(Math.random()*k));
+    var guard = 0, cap = d*20 + 1000;
+    while (set.size < d && guard++ < cap) set.add(rng() % k);
+    if (set.size < d){ for (var i=0;i<k && set.size<d;i++) set.add(i); }
     return Array.from(set);
   }
 
   // ---------------------------------------------------------------------
-  // Quality presets: QR version (typeNumber), error-correction level,
-  // and resulting fixed block payload size (capacity - packet overhead).
-  // Capacities were empirically measured against this exact vendored
-  // qrcode-generator build (byte mode, see dev notes).
+  // Quality presets: QR version (typeNumber), error-correction level, and
+  // byte-mode capacity measured against this exact vendored library build.
+  // Data packet layout (type 0x02) is FIXED-SIZE:
+  //   type(1) sessionId(4) packetId(4) k(2) blockSize(2) compressedSize(4)
+  //   originalSize(4) crcCompressed(4) payload(blockSize) crc32(4)
+  // => overhead 29 bytes, so blockSize = capacity - 29 always fits.
+  // (v1 sent explicit indices, which overflowed QR capacity for degree>8.)
   // ---------------------------------------------------------------------
   var PRESETS = {
     dense:    { type: 30, ecc: 'L', capacity: 1732, modules: 137 },
     balanced: { type: 22, ecc: 'L', capacity: 1003, modules: 105 },
     robust:   { type: 15, ecc: 'M', capacity: 412,  modules: 77  }
   };
-  var HEADER_RESEND_EVERY = 12; // re-show the metadata header every N data frames
-  var MAX_DEGREE = 60;
+  var DATA_OVERHEAD = 29;
+  var HEADER_EVERY = 40;   // filename-carrying header frame cadence (metadata rides in every data packet)
 
   // ---------------------------------------------------------------------
   // UI elements
@@ -2508,12 +2577,16 @@ var qrcode = function() {
   var fileInput = document.getElementById('fileInput');
   var presetSel = document.getElementById('preset');
   var intervalSel = document.getElementById('interval');
+  var gridSel = document.getElementById('gridSel');
   var startBtn = document.getElementById('startBtn');
   var stopBtn = document.getElementById('stopBtn');
   var resetBtn = document.getElementById('resetBtn');
+  var micBtn = document.getElementById('micBtn');
+  var fsBtn = document.getElementById('fsBtn');
   var statusBadge = document.getElementById('statusBadge');
   var fileInfo = document.getElementById('fileInfo');
   var canvas = document.getElementById('qrCanvas');
+  var stagePanel = document.getElementById('stagePanel');
   var progEl = document.getElementById('prog');
   var statsEl = document.getElementById('stats');
   var logBox = document.getElementById('logBox');
@@ -2533,12 +2606,16 @@ var qrcode = function() {
   var state = {
     fileBytes: null, fileName: '', originalSize: 0,
     compressed: null, compressedSize: 0,
-    blockSize: 0, k: 0, blocks: [], crcCompressed: 0,
+    blockSize: 0, paddedSize: 0, k: 0, blocks: [], crcCompressed: 0,
     sessionId: 0, cdf: null,
-    timer: null, running: false,
-    packetCounter: 0, framesSent: 0, bytesEncodedPayload: 0,
-    startedAt: 0
+    running: false,
+    nextSystematic: 0, nextFountain: 0,
+    framesShown: 0, packetsSent: 0, headerFramesSent: 0, payloadBytesSent: 0,
+    buildLag: 0,
+    startedAt: 0,
+    ackSolved: -1, ackAt: 0
   };
+  var ackQueue = [], ackQueued = new Set();
 
   function fmtBytes(n){
     if (n < 1024) return n+' B';
@@ -2547,8 +2624,12 @@ var qrcode = function() {
   }
 
   function renderStats(){
-    var elapsed = state.running ? (Date.now()-state.startedAt)/1000 : 0;
-    var throughput = elapsed>0 ? state.bytesEncodedPayload/elapsed : 0;
+    var elapsed = state.running ? (performance.now()-state.startedAt)/1000 : 0;
+    var throughput = elapsed>0 ? state.payloadBytesSent/elapsed : 0;
+    var ackTxt = '—';
+    if (state.ackSolved >= 0){
+      ackTxt = state.ackSolved+' / '+state.k+' blocks ('+Math.round((Date.now()-state.ackAt)/1000)+'s ago)';
+    }
     var rows = [
       ['File', state.fileName || '—'],
       ['Original size', state.originalSize ? fmtBytes(state.originalSize) : '—'],
@@ -2557,10 +2638,15 @@ var qrcode = function() {
       ['Blocks (k)', state.k || '—'],
       ['Block size', state.blockSize ? state.blockSize+' B' : '—'],
       ['QR version / ECC', state.k ? (PRESETS[presetSel.value].type+' / '+PRESETS[presetSel.value].ecc) : '—'],
+      ['Codes per frame', gridSel.value==='2' ? '4 (2×2)' : '1'],
       ['Session ID', state.sessionId ? ('0x'+state.sessionId.toString(16)) : '—'],
-      ['Frames sent', state.framesSent],
+      ['Display frames shown', state.framesShown],
+      ['Data packets sent', state.packetsSent],
+      ['Missed swap deadlines', state.buildLag],
+      ['ACK mic', mic.on ? 'listening' : 'off'],
+      ['Receiver progress (ACK)', ackTxt],
       ['Elapsed', elapsed.toFixed(1)+' s'],
-      ['Effective throughput', fmtBytes(throughput)+'/s']
+      ['Raw QR payload rate', fmtBytes(throughput)+'/s']
     ];
     statsEl.innerHTML = rows.map(function(r){
       return '<div class="k">'+r[0]+'</div><div class="v">'+r[1]+'</div>';
@@ -2569,73 +2655,125 @@ var qrcode = function() {
   setInterval(renderStats, 400);
 
   // ---------------------------------------------------------------------
-  // File loading: read -> deflateRaw -> split into fixed-size blocks
+  // Screen wake lock — keep the display on while broadcasting
+  // ---------------------------------------------------------------------
+  var wakeLock = null;
+  function acquireWakeLock(){
+    if (navigator.wakeLock && navigator.wakeLock.request){
+      navigator.wakeLock.request('screen').then(function(wl){
+        wakeLock = wl;
+        wl.addEventListener && wl.addEventListener('release', function(){ wakeLock = null; });
+      }).catch(function(){});
+    }
+  }
+  function releaseWakeLock(){
+    if (wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
+  }
+
+  // ---------------------------------------------------------------------
+  // Compression: native CompressionStream when available (off-main-thread,
+  // much faster than JS deflate on big files), pako as the fallback.
+  // ---------------------------------------------------------------------
+  function compressBytes(bytes){
+    if (typeof CompressionStream !== 'undefined'){
+      try {
+        var cs = new CompressionStream('deflate-raw');
+        return new Response(new Blob([bytes]).stream().pipeThrough(cs)).arrayBuffer()
+          .then(function(ab){ return new Uint8Array(ab); })
+          .catch(function(){ return pako.deflateRaw(bytes, {level:7}); });
+      } catch(e){ /* fall through */ }
+    }
+    return Promise.resolve().then(function(){ return pako.deflateRaw(bytes, {level:7}); });
+  }
+
+  // ---------------------------------------------------------------------
+  // File loading: read -> deflate -> split into k blocks (4-byte padded so
+  // XOR runs over Uint32Array lanes)
   // ---------------------------------------------------------------------
   fileInput.addEventListener('change', function(){
     var f = fileInput.files[0];
     if (!f) return;
     var reader = new FileReader();
     reader.onload = function(e){
-      try {
-        prepareFile(f.name, new Uint8Array(e.target.result));
-      } catch(err){
-        log('ERROR preparing file: '+err.message);
-        fileInfo.textContent = 'Failed to prepare file: '+err.message;
-      }
+      prepareFile(f.name, new Uint8Array(e.target.result));
     };
     reader.onerror = function(){ log('ERROR reading file from disk.'); };
     reader.readAsArrayBuffer(f);
   });
 
   presetSel.addEventListener('change', function(){
-    if (state.fileBytes) prepareFile(state.fileName, state.fileBytes, true);
+    if (state.fileBytes) prepareFile(state.fileName, state.fileBytes);
+  });
+  gridSel.addEventListener('change', function(){
+    if (state.k) computeLayout();
   });
 
-  function prepareFile(name, bytes, keepStopped){
+  var scratchB = null, scratchW = null;
+
+  function prepareFile(name, bytes){
     state.fileName = name;
     state.fileBytes = bytes;
     state.originalSize = bytes.length;
+    startBtn.disabled = true;
+    fileInfo.textContent = 'Compressing "'+name+'"…';
+    compressBytes(bytes).then(function(compressed){
+      if (state.fileBytes !== bytes) return; // superseded by a newer selection
+      state.compressed = compressed;
+      state.compressedSize = compressed.length;
+      state.crcCompressed = crc32(compressed);
 
-    var compressed = pako.deflateRaw(bytes, {level:9});
-    state.compressed = compressed;
-    state.compressedSize = compressed.length;
-    state.crcCompressed = crc32(compressed);
+      var preset = PRESETS[presetSel.value];
+      state.blockSize = preset.capacity - DATA_OVERHEAD;
+      state.k = Math.max(1, Math.ceil(compressed.length / state.blockSize));
+      if (state.k > 65535){
+        fileInfo.textContent = 'File too large for this preset ('+state.k+' blocks > 65535). Pick a denser preset or a smaller file.';
+        state.k = 0;
+        return;
+      }
+      state.paddedSize = Math.ceil(state.blockSize/4)*4;
 
-    var preset = PRESETS[presetSel.value];
-    var overheadGuess = 14 + 2*Math.min(MAX_DEGREE, 8); // rough, just to pick a sane block size
-    state.blockSize = Math.max(16, preset.capacity - overheadGuess);
-    state.k = Math.max(1, Math.ceil(compressed.length / state.blockSize));
+      state.blocks = [];
+      for (var i=0;i<state.k;i++){
+        var buf = new ArrayBuffer(state.paddedSize);
+        var b = new Uint8Array(buf);
+        var start = i*state.blockSize;
+        var end = Math.min(start+state.blockSize, compressed.length);
+        b.set(compressed.subarray(start, end));
+        state.blocks.push({ b: b, w: new Uint32Array(buf) });
+      }
+      var sb = new ArrayBuffer(state.paddedSize);
+      scratchB = new Uint8Array(sb);
+      scratchW = new Uint32Array(sb);
 
-    // split into k fixed-size blocks, zero-padding the final block
-    state.blocks = [];
-    for (var i=0;i<state.k;i++){
-      var b = new Uint8Array(state.blockSize);
-      var start = i*state.blockSize;
-      var end = Math.min(start+state.blockSize, compressed.length);
-      b.set(compressed.subarray(start,end));
-      state.blocks.push(b);
-    }
-    state.cdf = buildSolitonCDF(state.k);
+      state.cdf = buildDegreeCDF(state.k);
+      state.sessionId = (Math.random()*0xFFFFFFFF)>>>0;
+      state.nextSystematic = 0;
+      state.nextFountain = state.k;
+      state.framesShown = 0; state.packetsSent = 0; state.headerFramesSent = 0;
+      state.payloadBytesSent = 0; state.buildLag = 0;
+      state.ackSolved = -1;
+      ackQueue.length = 0; ackQueued.clear();
 
-    // new session id every time we (re)prepare a file
-    state.sessionId = (Math.random()*0xFFFFFFFF)>>>0;
-    state.packetCounter = 0;
-    state.framesSent = 0;
-    state.bytesEncodedPayload = 0;
-
-    fileInfo.textContent = name+' — '+fmtBytes(bytes.length)+' original, '+
-      fmtBytes(compressed.length)+' compressed, '+state.k+' blocks of '+state.blockSize+' B.';
-    log('Prepared "'+name+'": '+state.k+' blocks, session 0x'+state.sessionId.toString(16)+'.');
-    startBtn.disabled = false;
-    renderStats();
+      fileInfo.textContent = name+' — '+fmtBytes(bytes.length)+' original, '+
+        fmtBytes(compressed.length)+' compressed, '+state.k+' blocks of '+state.blockSize+' B.';
+      log('Prepared "'+name+'": '+state.k+' blocks, session 0x'+state.sessionId.toString(16)+'.');
+      startBtn.disabled = false;
+      computeLayout();
+      renderStats();
+    }).catch(function(err){
+      log('ERROR preparing file: '+err.message);
+      fileInfo.textContent = 'Failed to prepare file: '+err.message;
+    });
   }
 
   // ---------------------------------------------------------------------
   // Packet construction
-  //   HEADER (type 0x00): magic 'AGQ1', sessionId, fileNameLen, fileName,
-  //     originalSize, compressedSize, blockSize, k, crcCompressed, crcHeader
-  //   DATA   (type 0x01): sessionId, packetId, degree, indices[uint16]*,
-  //     xorPayload[blockSize], crcPayload
+  //   HEADER (0x00): sessionId, fileNameLen, fileName, originalSize,
+  //     compressedSize, blockSize, k, crcCompressed, crcHeader — carries
+  //     the filename; all numeric metadata also rides in every data packet.
+  //   DATA (0x02): fixed layout, see PRESETS comment above. Indices are
+  //     NOT transmitted; the receiver derives them from (sessionId,
+  //     packetId, k) with the shared deterministic PRNG.
   // ---------------------------------------------------------------------
   function buildHeaderPacket(){
     var nameBytes = new TextEncoder().encode(state.fileName);
@@ -2653,45 +2791,62 @@ var qrcode = function() {
     dv.setUint16(o, state.blockSize); o+=2;
     dv.setUint16(o, state.k); o+=2;
     dv.setUint32(o, state.crcCompressed); o+=4;
-    var headerCrc = crc32(buf, 0, o);
-    dv.setUint32(o, headerCrc); o+=4;
+    dv.setUint32(o, crc32(buf, 0, o)); o+=4;
     return buf;
   }
 
-  function buildDataPacket(){
-    var d = state.k===1 ? 1 : sampleDegree(state.cdf, state.k);
-    d = Math.min(d, MAX_DEGREE, state.k);
-    var idxs = state.k===1 ? [0] : pickIndices(d, state.k);
-    var payload = new Uint8Array(state.blockSize);
+  function buildDataPacket(pid){
+    var idxs = indicesForPacket(state.sessionId, pid, state.k, state.cdf);
+    scratchW.fill(0);
     for (var i=0;i<idxs.length;i++){
-      var blk = state.blocks[idxs[i]];
-      for (var j=0;j<state.blockSize;j++) payload[j] ^= blk[j];
+      var w = state.blocks[idxs[i]].w;
+      for (var j=0;j<scratchW.length;j++) scratchW[j] ^= w[j];
     }
-    var len = 1+4+4+1+2*idxs.length+state.blockSize+4;
+    var len = DATA_OVERHEAD + state.blockSize;
     var buf = new Uint8Array(len);
     var dv = new DataView(buf.buffer);
-    var o = 0;
-    buf[o++] = 0x01;
-    dv.setUint32(o, state.sessionId); o+=4;
-    dv.setUint32(o, state.packetCounter); o+=4;
-    buf[o++] = idxs.length;
-    for (var i=0;i<idxs.length;i++){ dv.setUint16(o, idxs[i]); o+=2; }
-    buf.set(payload, o); o += state.blockSize;
-    var payloadCrc = crc32(payload);
-    dv.setUint32(o, payloadCrc); o+=4;
-    state.packetCounter++;
-    return {buf: buf, degree: idxs.length};
+    buf[0] = 0x02;
+    dv.setUint32(1, state.sessionId);
+    dv.setUint32(5, pid);
+    dv.setUint16(9, state.k);
+    dv.setUint16(11, state.blockSize);
+    dv.setUint32(13, state.compressedSize);
+    dv.setUint32(17, state.originalSize);
+    dv.setUint32(21, state.crcCompressed);
+    buf.set(scratchB.subarray(0, state.blockSize), 25);
+    dv.setUint32(len-4, crc32(buf, 0, len-4));
+    return buf;
+  }
+
+  // Scheduler: ACK-requested resends first, then the systematic pass
+  // (each block once, verbatim), then endless fountain packets.
+  var dispFrame = 0;
+  function nextPacketBytes(cellIndex){
+    if (cellIndex === 0 && (dispFrame < 2 || dispFrame % HEADER_EVERY === 0)){
+      state.headerFramesSent++;
+      return buildHeaderPacket();
+    }
+    var pid;
+    if (ackQueue.length){ pid = ackQueue.shift(); ackQueued.delete(pid); }
+    else if (state.nextSystematic < state.k) pid = state.nextSystematic++;
+    else pid = state.nextFountain++;
+    state.packetsSent++;
+    var buf = buildDataPacket(pid);
+    state.payloadBytesSent += buf.length;
+    return buf;
   }
 
   // ---------------------------------------------------------------------
-  // QR rendering — pixel-aligned, no fractional scaling (avoids blur/
-  // anti-aliasing seams that would otherwise hurt camera decode rates)
+  // QR rendering. Each cell is generated as a 1px-per-module ImageData
+  // (quiet zone included) and scaled up with smoothing disabled at blit
+  // time — far cheaper than thousands of fillRect calls, and pixel-exact.
   // ---------------------------------------------------------------------
   var ctx = canvas.getContext('2d');
-  function renderQR(bytes){
+  var cellSrc = document.createElement('canvas');
+  var cellSrcCtx = cellSrc.getContext('2d');
+
+  function makeCellImage(bytes){
     var str = '';
-    // Build the binary string in chunks to avoid call-stack issues on
-    // large arrays with String.fromCharCode(...spread).
     var CH = 4096;
     for (var i=0;i<bytes.length;i+=CH){
       str += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+CH, bytes.length)));
@@ -2700,84 +2855,164 @@ var qrcode = function() {
     var qr = qrcode(preset.type, preset.ecc);
     qr.addData(str, 'Byte');
     qr.make();
-    var moduleCount = qr.getModuleCount();
-    var quiet = 4;
-    var total = moduleCount + quiet*2;
-    var targetPx = Math.min(window.innerWidth, window.innerHeight) * 0.86;
-    var scale = Math.max(2, Math.floor(targetPx/total));
-    var size = total*scale;
-    canvas.width = size; canvas.height = size;
-    canvas.style.width = size+'px'; canvas.style.height = size+'px';
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0,0,size,size);
-    ctx.fillStyle = '#000000';
-    for (var r=0;r<moduleCount;r++){
-      for (var c=0;c<moduleCount;c++){
+    var n = qr.getModuleCount(), q = 4, t = n + 2*q;
+    var img = new ImageData(t, t);
+    img.data.fill(255);
+    for (var r=0;r<n;r++){
+      for (var c=0;c<n;c++){
         if (qr.isDark(r,c)){
-          ctx.fillRect((c+quiet)*scale, (r+quiet)*scale, scale, scale);
+          var p = ((r+q)*t + (c+q))*4;
+          img.data[p] = 0; img.data[p+1] = 0; img.data[p+2] = 0;
         }
       }
     }
-    return bytes.length;
+    return { img: img, t: t };
   }
 
+  var layout = null;
+  function computeLayout(){
+    var preset = PRESETS[presetSel.value];
+    var g = parseInt(gridSel.value, 10);
+    var mods = preset.modules + 8;
+    var fs = document.fullscreenElement != null;
+    var target = Math.min(window.innerWidth*(fs?0.99:0.95), window.innerHeight*(fs?0.92:0.86));
+    var scale = Math.max(1, Math.floor(target/(mods*g)));
+    var cell = mods*scale, size = cell*g;
+    var beaconH = Math.max(10, 3*scale);
+    layout = { g: g, cell: cell, size: size, beaconH: beaconH };
+    canvas.width = size; canvas.height = size + 2 + beaconH;
+    canvas.style.width = canvas.width+'px'; canvas.style.height = canvas.height+'px';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.imageSmoothingEnabled = false;
+    if (lastCells) blitCells(lastCells, false);
+  }
+  window.addEventListener('resize', function(){ if (layout) computeLayout(); });
+  document.addEventListener('fullscreenchange', function(){ if (layout) computeLayout(); });
+
+  fsBtn.addEventListener('click', function(){
+    var el = stagePanel;
+    if (document.fullscreenElement){ document.exitFullscreen && document.exitFullscreen(); }
+    else if (el.requestFullscreen){ el.requestFullscreen().catch(function(){}); }
+  });
+
   // ---------------------------------------------------------------------
-  // Main loop
+  // Display pipeline: rAF-paced (vsync-aligned) frame swaps; the next
+  // frame's cells are built incrementally during the current frame's
+  // display window so the swap itself is just a blit.
   // ---------------------------------------------------------------------
-  var frameCounter = 0;
-  function tick(){
-    if (!state.running) return;
-    var bytes, kind;
-    if (frameCounter % HEADER_RESEND_EVERY === 0){
-      bytes = buildHeaderPacket();
-      kind = 'HEADER';
-    } else {
-      var r = buildDataPacket();
-      bytes = r.buf;
-      kind = 'DATA(deg='+r.degree+')';
+  var pendingCells = null, pendingBuilt = 0, pendingReady = false;
+  var lastCells = null, beaconPhase = 0, nextSwap = 0, rafId = null;
+
+  function startBuild(){
+    var n = layout.g*layout.g;
+    pendingCells = new Array(n);
+    pendingBuilt = 0;
+    pendingReady = false;
+  }
+  function buildStep(){
+    if (pendingReady || !pendingCells) return;
+    try {
+      pendingCells[pendingBuilt] = makeCellImage(nextPacketBytes(pendingBuilt));
+    } catch(e){
+      log('Frame build error (skipped packet): '+e.message);
+      pendingCells[pendingBuilt] = pendingCells[0] || null;
     }
-    frameCounter++;
-    state.framesSent++;
-    state.bytesEncodedPayload += bytes.length;
-    renderQR(bytes);
-    progEl.value = Math.min(1, state.framesSent/Math.max(state.k,1));
-    if (state.framesSent % 40 === 0) log('Sent '+state.framesSent+' frames so far ('+kind+').');
+    pendingBuilt++;
+    if (pendingBuilt >= pendingCells.length) pendingReady = true;
+  }
+  function blitCells(cells, advance){
+    var L = layout;
+    ctx.imageSmoothingEnabled = false;
+    for (var i=0;i<cells.length;i++){
+      var cell = cells[i];
+      if (!cell) continue;
+      if (cellSrc.width !== cell.t){ cellSrc.width = cell.t; cellSrc.height = cell.t; }
+      cellSrcCtx.putImageData(cell.img, 0, 0);
+      var gx = (i % L.g)*L.cell, gy = Math.floor(i/L.g)*L.cell;
+      ctx.drawImage(cellSrc, 0, 0, cell.t, cell.t, gx, gy, L.cell, L.cell);
+    }
+    if (advance) beaconPhase ^= 1;
+    // frame-change beacon: two half-bars that swap black/white every frame,
+    // so a receiver (or a human) can tell stale frames from fresh ones.
+    var by = L.size + 2;
+    ctx.fillStyle = beaconPhase ? '#000000' : '#ffffff';
+    ctx.fillRect(0, by, Math.floor(canvas.width/2), L.beaconH);
+    ctx.fillStyle = beaconPhase ? '#ffffff' : '#000000';
+    ctx.fillRect(Math.floor(canvas.width/2), by, canvas.width-Math.floor(canvas.width/2), L.beaconH);
+  }
+
+  function loop(now){
+    if (!state.running) return;
+    rafId = requestAnimationFrame(loop);
+    // build budget: two cells per tick (a 2x2 grid at 50ms needs ~1.4/tick),
+    // plus one extra when we're already past the swap deadline
+    if (!pendingReady) buildStep();
+    if (!pendingReady) buildStep();
+    if (!pendingReady && now >= nextSwap) buildStep();
+    if (now >= nextSwap){
+      if (pendingReady){
+        blitCells(pendingCells, true);
+        lastCells = pendingCells;
+        state.framesShown++;
+        dispFrame++;
+        var iv = parseInt(intervalSel.value, 10);
+        nextSwap = (now - nextSwap > iv) ? now + iv : nextSwap + iv;
+        startBuild();
+        progEl.value = state.ackSolved >= 0
+          ? Math.min(1, state.ackSolved/Math.max(state.k,1))
+          : Math.min(1, state.packetsSent/Math.max(state.k,1));
+      } else {
+        state.buildLag++;
+      }
+    }
   }
 
   startBtn.addEventListener('click', function(){
     if (!state.k) return;
     state.running = true;
-    state.startedAt = Date.now();
-    frameCounter = 0;
+    state.startedAt = performance.now();
+    dispFrame = 0;
     statusBadge.textContent = 'BROADCASTING';
     statusBadge.className = 'badge run';
     startBtn.disabled = true;
     stopBtn.disabled = false;
     fileInput.disabled = true;
     presetSel.disabled = true;
-    var ms = parseInt(intervalSel.value, 10);
-    state.timer = setInterval(tick, ms);
-    tick();
-    log('Started broadcasting. Interval='+ms+'ms, preset='+presetSel.value+'.');
+    gridSel.disabled = true;
+    computeLayout();
+    startBuild();
+    while (!pendingReady) buildStep();
+    nextSwap = performance.now();
+    rafId = requestAnimationFrame(loop);
+    acquireWakeLock();
+    log('Started broadcasting: '+intervalSel.value+'ms/frame, preset='+presetSel.value+
+        ', '+(layout.g*layout.g)+' code(s)/frame. Systematic pass first, then fountain.');
   });
 
   stopBtn.addEventListener('click', stopBroadcast);
   function stopBroadcast(){
     state.running = false;
-    if (state.timer) clearInterval(state.timer);
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    releaseWakeLock();
     statusBadge.textContent = 'STOPPED';
     statusBadge.className = 'badge idle';
-    startBtn.disabled = false;
+    startBtn.disabled = !state.k;
     stopBtn.disabled = true;
     fileInput.disabled = false;
     presetSel.disabled = false;
-    log('Stopped. '+state.framesSent+' frames were broadcast in total.');
+    gridSel.disabled = false;
+    log('Stopped. '+state.framesShown+' frames shown, '+state.packetsSent+' data packets sent.');
   }
 
   resetBtn.addEventListener('click', function(){
     stopBroadcast();
     fileInput.value = '';
     state.fileBytes = null; state.k = 0; state.blocks = [];
+    state.ackSolved = -1;
+    ackQueue.length = 0; ackQueued.clear();
+    lastCells = null;
     fileInfo.textContent = 'No file selected.';
     startBtn.disabled = true;
     progEl.value = 0;
@@ -2785,21 +3020,170 @@ var qrcode = function() {
     log('Reset. Ready for a new file.');
   });
 
-  // Pause the interval when the tab is hidden (mobile background throttling
-  // would otherwise desync timing or silently stop firing); resume on return.
   document.addEventListener('visibilitychange', function(){
-    if (document.hidden && state.timer){
-      clearInterval(state.timer); state.timer = null;
-      log('Tab hidden — paused broadcasting.');
-    } else if (!document.hidden && state.running && !state.timer){
-      var ms = parseInt(intervalSel.value, 10);
-      state.timer = setInterval(tick, ms);
+    if (!document.hidden && state.running){
+      nextSwap = performance.now() + 100; // avoid a burst of catch-up swaps
+      acquireWakeLock();
       log('Tab visible again — resumed broadcasting.');
+    } else if (document.hidden && state.running){
+      log('Tab hidden — display paused (browser throttles hidden tabs).');
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Success chime (played when the receiver acknowledges completion)
+  // ---------------------------------------------------------------------
+  function playChime(actx){
+    if (!actx) return;
+    try {
+      var notes = [523.25, 659.25, 783.99, 1046.5];
+      for (var i=0;i<notes.length;i++){
+        var o = actx.createOscillator(), g = actx.createGain();
+        o.type = 'sine'; o.frequency.value = notes[i];
+        var t = actx.currentTime + 0.02 + i*0.12;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.25, t+0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+0.9);
+        o.connect(g); g.connect(actx.destination);
+        o.start(t); o.stop(t+1);
+      }
+    } catch(e){}
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio ACK back-channel (receiver speaker -> this device's microphone).
+  // 16-FSK, 90ms slots, tones 1500..4200 Hz (180 Hz apart), SEP 1150 Hz,
+  // preamble 4700/4400 Hz alternating, message ends with a 4700 Hz slot,
+  // CRC-8 (poly 0x07) over the payload bytes.
+  //   DONE:     [0xD1, sessionIdLowByte]
+  //   PROGRESS: [0xA2, sessionIdLowByte, solvedLo, solvedHi, (missingIdx u16le)*0..3]
+  // Optional: everything works one-way without it. When enabled the sender
+  // auto-stops on DONE and prioritizes resending NACKed blocks.
+  // ---------------------------------------------------------------------
+  var ACKF = { SEP: 1150, PRE_A: 4700, PRE_B: 4400, TONE0: 1500, TSTEP: 180, TOL: 70 };
+  var mic = { ctx: null, stream: null, analyser: null, data: null, timer: null, on: false };
+
+  micBtn.addEventListener('click', function(){
+    if (mic.on){ disableMic(); return; }
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } })
+      .then(function(s){
+        mic.stream = s;
+        mic.ctx = new (window.AudioContext||window.webkitAudioContext)();
+        var src = mic.ctx.createMediaStreamSource(s);
+        mic.analyser = mic.ctx.createAnalyser();
+        mic.analyser.fftSize = 8192;
+        mic.analyser.smoothingTimeConstant = 0;
+        src.connect(mic.analyser);
+        mic.data = new Float32Array(mic.analyser.frequencyBinCount);
+        mic.timer = setInterval(pollFsk, 18);
+        mic.on = true;
+        micBtn.textContent = 'Disable ACK Mic';
+        log('ACK microphone enabled — listening for receiver audio acknowledgements.');
+      })
+      .catch(function(err){ log('Microphone unavailable: '+err.message+' (transfer still works one-way).'); });
+  });
+  function disableMic(){
+    if (mic.timer) clearInterval(mic.timer);
+    if (mic.stream) mic.stream.getTracks().forEach(function(t){ t.stop(); });
+    if (mic.ctx){ try{ mic.ctx.close(); }catch(e){} }
+    mic.ctx = null; mic.stream = null; mic.analyser = null; mic.timer = null; mic.on = false;
+    micBtn.textContent = 'Enable ACK Mic';
+    log('ACK microphone disabled.');
+  }
+
+  function symbolForFreq(f){
+    if (Math.abs(f-ACKF.PRE_A) < ACKF.TOL) return 17;
+    if (Math.abs(f-ACKF.PRE_B) < ACKF.TOL) return 18;
+    if (Math.abs(f-ACKF.SEP)   < ACKF.TOL) return 16;
+    var n = Math.round((f-ACKF.TONE0)/ACKF.TSTEP);
+    if (n>=0 && n<16 && Math.abs(f-(ACKF.TONE0+n*ACKF.TSTEP)) < ACKF.TOL) return n;
+    return -1;
+  }
+
+  var runCur = { sym: null, n: 0 }, runs = [], silence = 0;
+  function pollFsk(){
+    if (!mic.analyser) return;
+    mic.analyser.getFloatFrequencyData(mic.data);
+    var binHz = mic.ctx.sampleRate/mic.analyser.fftSize;
+    var lo = Math.floor(1080/binHz), hi = Math.min(mic.data.length-1, Math.ceil(4850/binHz));
+    var maxDb = -1/0, maxI = lo, sum = 0, cnt = 0;
+    for (var i=lo;i<=hi;i++){
+      var v = mic.data[i];
+      sum += v; cnt++;
+      if (v > maxDb){ maxDb = v; maxI = i; }
+    }
+    var mean = sum/Math.max(1,cnt);
+    var sym = -1;
+    if (maxDb > mean+12 && maxDb > -80) sym = symbolForFreq(maxI*binHz);
+    if (sym < 0){
+      silence++;
+      if (silence === 8 && runs.length && runs[runs.length-1].sym !== -2) runs.push({sym:-2, n:1});
+    } else silence = 0;
+    if (sym === runCur.sym){ runCur.n++; return; }
+    if (runCur.sym !== null && runCur.sym >= 0 && runCur.n >= 2){
+      if (runs.length && runs[runs.length-1].sym === runCur.sym) runs[runs.length-1].n += runCur.n;
+      else runs.push({sym: runCur.sym, n: runCur.n});
+      if (runs.length > 400) runs.splice(0, 200);
+      tryDecodeRuns();
+    }
+    runCur = { sym: sym, n: 1 };
+  }
+
+  function tryDecodeRuns(){
+    var i = -1;
+    for (var j=runs.length-4;j>=0;j--){
+      if (runs[j].sym===17 && runs[j+1].sym===18 && runs[j+2].sym===17 && runs[j+3].sym===18){ i = j; break; }
+    }
+    if (i < 0){ if (runs.length > 240) runs.splice(0, 120); return; }
+    var p = i+4, nibbles = [];
+    while (p < runs.length){
+      var s = runs[p].sym;
+      if (s === 17){ finalizeAck(nibbles); runs.length = 0; return; }
+      if (s === -2){ runs.splice(0, p+1); return; }
+      if (s !== 16) return;       // wait for more samples
+      if (p+1 >= runs.length) return;
+      var d = runs[p+1].sym;
+      if (d < 0 || d > 15){ runs.splice(0, p+1); return; }
+      nibbles.push(d);
+      p += 2;
+    }
+  }
+
+  function finalizeAck(nibbles){
+    if (nibbles.length < 6 || nibbles.length % 2) return;
+    var bytes = [];
+    for (var i=0;i<nibbles.length;i+=2) bytes.push((nibbles[i]<<4)|nibbles[i+1]);
+    var crc = bytes.pop();
+    if (crc8(bytes) !== crc){ log('Audio ACK failed checksum (ignored).'); return; }
+    handleAckMessage(bytes);
+  }
+
+  function handleAckMessage(b){
+    if (!state.sessionId || b[1] !== (state.sessionId & 0xff)) return;
+    if (b[0] === 0xD1){
+      log('AUDIO ACK: receiver confirmed transfer COMPLETE — stopping broadcast.');
+      if (state.running) stopBroadcast();
+      statusBadge.textContent = 'DONE (ACKED)';
+      statusBadge.className = 'badge run';
+      state.ackSolved = state.k; state.ackAt = Date.now();
+      progEl.value = 1;
+      playChime(mic.ctx);
+    } else if (b[0] === 0xA2 && b.length >= 4){
+      var solved = b[2] | (b[3]<<8);
+      state.ackSolved = Math.min(solved, state.k);
+      state.ackAt = Date.now();
+      var wanted = [];
+      for (var i=4;i+1<b.length;i+=2){
+        var m = b[i] | (b[i+1]<<8);
+        if (m < state.k && !ackQueued.has(m)){ ackQueued.add(m); ackQueue.push(m); wanted.push(m); }
+      }
+      log('AUDIO ACK: receiver has '+solved+'/'+state.k+' blocks'+
+          (wanted.length ? ' — prioritizing resend of block(s) '+wanted.join(', ') : '')+'.');
+    }
+  }
+
   renderStats();
-  log('Ready. Select a file to begin.');
+  log('Ready. Select a file to begin. Optionally enable the ACK mic so the receiver can auto-stop this sender.');
 })();
 </script>
 </body>
