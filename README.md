@@ -31,7 +31,7 @@ On the device that has the file, just double-click `sender.html` (or open it via
 1. Choose a file.
 2. Pick a quality preset (**Balanced** is the default — see [Choosing a preset](#choosing-a-preset)) and a frame interval.
 3. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
-4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion. Denying (or the prompt not appearing) just means one-way mode; use **Enable ACK Mic** to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page, serve it from the same local server as the receiver to use audio ACKs.
+4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion. Denying (or the prompt not appearing) just means one-way mode — the **ACK mic** checkbox unticks itself; re-tick it to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page, serve it from the same local server as the receiver to use audio ACKs.
 
 ### 2. Open the receiver
 
@@ -54,7 +54,12 @@ Then open **`http://localhost:8000/receiver.html`** in your browser.
 
 ### 3. Sending another file
 
-Click **New Transfer** on the sender (lets you choose a new file). Every click of **Start Broadcasting** mints a fresh session id — even a rebroadcast of the same file — and the receiver detects the new session on its own after a few frames and resets automatically, so you normally don't need to touch the receiver at all (**Reset Session** exists for forcing a manual reset). You don't need to reload either page.
+Click **New Transfer** on the sender and choose the file (each prepared file gets a fresh session id; the receiver detects the new session on its own after a few frames and resets automatically, so you normally don't need to touch the receiver at all — **Reset Session** exists for forcing a manual reset). You don't need to reload either page.
+
+Two related behaviors worth knowing:
+
+- **Stop → Start on the sender *resumes* an interrupted transfer.** The session id is stable per prepared file, so the receiver keeps every block it already has and the restarted stream fills the gaps — nothing is lost by pausing.
+- **Rebroadcasting an already-completed session** makes the receiver answer with DONE chirps instead of re-receiving; the sender auto-stops and logs that you should use **New Transfer** to send the file again.
 
 ---
 
@@ -65,7 +70,7 @@ Click **New Transfer** on the sender (lets you choose a new file). Every click o
 | **Balanced** *(default)* | 22 (105×105 modules)                        | 974 B         | Good speed/reliability trade-off for most phone cameras at arm's length.                                                                     |
 | **Robust**               | 15 (77×77 modules), higher error-correction | 383 B         | Slowest, but will scan reliably even with a poor camera, bad lighting, or some hand shake. Use this if Balanced is failing to make progress. |
 
-Theoretical rate at Balanced is ~9.7 KB/s at 10 frames/s, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" count climbs or progress stalls, slow the interval down before reaching for the Robust preset. (An extra-dense version-30 preset and a 2×2 multi-QR grid existed briefly and were removed — in field tests typical cameras never decoded them.)
+Theoretical rate at Balanced is ~9.7 KB/s at 10 frames/s, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" count climbs or progress stalls, slow the interval down before reaching for the Robust preset. (Three throughput experiments were field-tested and removed: an extra-dense version-30 preset and a 2×2 multi-QR grid, which typical cameras never decoded, and a color-multiplexed "2×" mode packing two QR codes into the red and blue channels of one image, which was ~2× *slower* — camera Bayer sensors sample R and B at only a quarter of the pixels, so each color channel carries about half the linear resolution of the mono image, and crosstalk cuts contrast further. The lesson generalizes: the camera's pixels-per-module budget is the binding constraint, and any scheme that shrinks the effective module size loses.)
 
 ---
 
@@ -246,8 +251,8 @@ Overhead is a constant **29 bytes**, so `blockSize = QR byte capacity − 29` (9
 
 Receiver speaker → sender microphone. 16-FSK: sixteen data tones at 1500–4200 Hz (180 Hz apart), separator tone 1150 Hz, preamble alternating 4700/4400 Hz, 90 ms slots. Each message is `preamble(4 slots) · [SEP, nibble]×2·len · END(4700 Hz)` with a CRC-8 (poly `0x07`) appended:
 
-- **DONE** `[0xD1, sessionIdLow]` — repeated 3 times after completion (enough for the sender to catch one without becoming a nuisance). The sender verifies the session byte, stops broadcasting, and plays the chime.
-- **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — chirped every ~8 s throughout the transfer (so the sender shows live receiver progress), tightening to every ~5 s with up to 3 missing block indices once ≥ 85% of blocks are solved. The sender pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
+- **DONE** `[0xD1, sessionIdLow]` — repeated 3 times after completion (enough for the sender to catch one without becoming a nuisance), and again whenever an already-completed session is being actively rebroadcast, so the sender always finds out and auto-stops. The sender verifies the session byte, stops broadcasting, and plays the chime.
+- **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — chirped every ~8 s **while packets are actually arriving** (within the last 10 s; a receiver never keeps talking to a sender that has stopped), tightening to every ~5 s with up to 3 missing block indices once ≥ 85% of blocks are solved. The sender pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
 
 Data rate is tiny (~20 bit/s) and that's fine: the QR channel carries the data; sound only carries *control*. The success chime uses notes at 523–1047 Hz, entirely below the FSK band, so it can never be mistaken for a symbol. Everything works with the channel disabled — it's an accelerator, not a dependency.
 

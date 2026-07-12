@@ -10375,7 +10375,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       pivots: new Map(), // pivotIndex -> {indices:Set, row}
       seen: new Map(),   // "sid:pid" -> last-accepted timestamp (short-lived; camera dedup only)
       framesScanned: 0, framesDecoded: 0, framesRejected: 0, framesDuplicate: 0, framesSkipped: 0,
-      lastDegree: 0, sawFirstPacket: false,
+      lastDegree: 0, sawFirstPacket: false, lastPacketAt: 0, lastPid: null,
       startedAt: Date.now(), completedAt: 0, complete: false, finalBytes: null,
       lastAckAt: 0, doneAcks: 0, warnedOldSender: false
     };
@@ -10536,6 +10536,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     // are cheap to absorb anyway.
     var key = sid+':'+pid;
     var now = Date.now();
+    // "the sender is live" requires CHANGING packet ids — a stale QR frozen
+    // on a stopped sender's screen repeats one id forever and must not keep
+    // the ACK chirps alive
+    if (pid !== S.lastPid){ S.lastPid = pid; S.lastPacketAt = now; }
     var last = S.seen.get(key);
     if (last !== undefined && now-last < 1500){ return 'dup'; }
     S.seen.set(key, now);
@@ -10696,15 +10700,21 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   setInterval(function(){
     if (!ackChk.checked || S.sessionId === null) return;
     var now = Date.now();
+    // "receiving" = a valid packet of this session arrived in the last 10s.
+    // Once the sender stops, chirps stop shortly after — a receiver must not
+    // keep talking to a sender that is no longer there.
+    var receiving = now - S.lastPacketAt < 10000;
     if (S.complete){
-      // three DONE repeats is enough for the sender to catch one; anything
-      // more is just noise once the file is already on disk
-      if (S.doneAcks < 3 && now - S.lastAckAt > 2500){
+      // three DONE repeats right after completion; after that, only reply
+      // when the (already-completed) session is actively being rebroadcast,
+      // so the sender auto-stops instead of streaming into the void
+      var spacing = S.doneAcks < 3 ? 2500 : 4000;
+      if ((S.doneAcks < 3 || receiving) && now - S.lastAckAt > spacing){
         if (sendAck([0xD1, S.sessionId & 0xff])){ S.doneAcks++; S.lastAckAt = now; }
       }
       return;
     }
-    if (!S.meta || !S.solved.size) return;
+    if (!S.meta || !S.solved.size || !receiving) return;
     var k = S.meta.k, solved = S.solved.size;
     var endgame = solved >= Math.floor(k*0.85);
     if (now - S.lastAckAt < (endgame ? 5000 : 8000)) return;
@@ -10893,7 +10903,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       rcx.drawImage(cv, sx, sy, sw, sh, 0, 0, w, h);
       var img = rcx.getImageData(0, 0, w, h);
       var sig = sigOf(img);
-      if (prevSig && sigDiff(sig, prevSig) < 5) return {r:null, sig:sig, skip:true};
+      if (prevSig && sigDiff(sig, prevSig) < 5) return {rs:[], sig:sig, skip:true};
+      var out = [];
       var r = null;
       try { r = jsQR(img.data, w, h, {inversionAttempts:'dontInvert'}); } catch(e){}
       if (r && r.binaryData && r.binaryData.length){
@@ -10908,10 +10919,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           if (cs[i].y < minY) minY = cs[i].y;
           if (cs[i].y > maxY) maxY = cs[i].y;
         }
-        return {r:{bytes:new Uint8Array(r.binaryData), corners:cs,
-                   box:{x:minX, y:minY, w:maxX-minX, h:maxY-minY}}, sig:sig, skip:false};
+        out.push({bytes:new Uint8Array(r.binaryData), corners:cs,
+                  box:{x:minX, y:minY, w:maxX-minX, h:maxY-minY}});
       }
-      return {r:null, sig:sig, skip:false};
+      return {rs:out, sig:sig, skip:false};
     }
 
     function quadrants(W, H){
@@ -10922,18 +10933,19 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       var found = [];
       if (mode === 'search'){
         flip = !flip;
+        var hits = [];
         if (flip){
           var res = scanRegion(0, 0, W, H, 900, null);
-          if (res.r) found.push(res.r);
+          if (res.rs.length){ found = found.concat(res.rs); hits.push(res.rs[0].box); }
         } else {
           var qs = quadrants(W, H);
           for (var i=0;i<qs.length;i++){
             var res2 = scanRegion(qs[i][0], qs[i][1], qs[i][2], qs[i][3], 700, null);
-            if (res2.r) found.push(res2.r);
+            if (res2.rs.length){ found = found.concat(res2.rs); hits.push(res2.rs[0].box); }
           }
         }
-        if (found.length){
-          boxes = found.map(function(f){ return {box:grow(f.box, GROW), miss:0, sig:null}; });
+        if (hits.length){
+          boxes = hits.map(function(b){ return {box:grow(b, GROW), miss:0, sig:null}; });
           mode = 'locked';
         }
       } else {
@@ -10942,10 +10954,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           var res3 = scanRegion(b.x, b.y, b.w, b.h, 720, bx.sig);
           bx.sig = res3.sig;
           if (res3.skip){ skipped.n++; continue; }
-          if (res3.r){
-            bx.box = grow(res3.r.box, GROW);
+          if (res3.rs.length){
+            bx.box = grow(res3.rs[0].box, GROW);
             bx.miss = 0;
-            found.push(res3.r);
+            found = found.concat(res3.rs);
           } else bx.miss++;
         }
         boxes = boxes.filter(function(b){ return b.miss < 25; });

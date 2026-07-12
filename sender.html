@@ -66,7 +66,9 @@
       <button class="primary" id="startBtn" disabled>Start Broadcasting</button>
       <button id="stopBtn" disabled>Stop</button>
       <button class="danger" id="resetBtn">New Transfer</button>
-      <button id="micBtn">Enable ACK Mic</button>
+      <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;">
+        <input type="checkbox" id="micChk" checked> ACK mic (listen for receiver, auto-stop)
+      </label>
       <button id="fsBtn">Fullscreen</button>
       <span id="statusBadge" class="badge idle">IDLE</span>
     </div>
@@ -2571,7 +2573,7 @@ var qrcode = function() {
   var startBtn = document.getElementById('startBtn');
   var stopBtn = document.getElementById('stopBtn');
   var resetBtn = document.getElementById('resetBtn');
-  var micBtn = document.getElementById('micBtn');
+  var micChk = document.getElementById('micChk');
   var fsBtn = document.getElementById('fsBtn');
   var statusBadge = document.getElementById('statusBadge');
   var fileInfo = document.getElementById('fileInfo');
@@ -2831,7 +2833,7 @@ var qrcode = function() {
   var cellSrc = document.createElement('canvas');
   var cellSrcCtx = cellSrc.getContext('2d');
 
-  function makeCellImage(bytes){
+  function makeQr(bytes){
     var str = '';
     var CH = 4096;
     for (var i=0;i<bytes.length;i+=CH){
@@ -2841,6 +2843,10 @@ var qrcode = function() {
     var qr = qrcode(preset.type, preset.ecc);
     qr.addData(str, 'Byte');
     qr.make();
+    return qr;
+  }
+  function makeCellImage(bytes){
+    var qr = makeQr(bytes);
     var n = qr.getModuleCount(), q = 4, t = n + 2*q;
     var img = new ImageData(t, t);
     img.data.fill(255);
@@ -2854,6 +2860,13 @@ var qrcode = function() {
     }
     return { img: img, t: t };
   }
+  // NOTE: a "Color 2x" mode (two QR codes multiplexed into the R and B color
+  // channels of one image) was implemented and field-tested here — it was
+  // ~2x SLOWER than mono. Camera Bayer sensors sample R and B at only 1/4 of
+  // the pixels, so each color channel has ~half the linear resolution of the
+  // luminance image, and channel crosstalk cuts contrast further. Any scheme
+  // that shrinks the effective module size below what the camera resolves in
+  // MONO loses. Removed; do not reintroduce without a custom (non-QR) code.
 
   var layout = null;
   function computeLayout(){
@@ -2957,22 +2970,19 @@ var qrcode = function() {
 
   startBtn.addEventListener('click', function(){
     if (!state.k) return;
-    // fresh session on EVERY broadcast — a rebroadcast of the same prepared
-    // file must not reuse the old sessionId, or a receiver that already
-    // completed that session would silently ignore the whole stream.
-    state.sessionId = (Math.random()*0xFFFFFFFF)>>>0;
+    // The sessionId is stable per PREPARED FILE (not per broadcast), so that
+    // Stop -> Start RESUMES an interrupted transfer: the receiver keeps its
+    // solved blocks and the restarted systematic pass fills the gaps. If the
+    // receiver already completed this session it answers with DONE chirps
+    // and we auto-stop; use "New Transfer" to force a fresh send.
     state.nextSystematic = 0;
     state.nextFountain = state.k;
     state.framesShown = 0; state.packetsSent = 0; state.headerFramesSent = 0;
     state.payloadBytesSent = 0; state.buildLag = 0;
-    state.ackSolved = -1;
-    ackQueue.length = 0; ackQueued.clear();
-    // audio ACKs are on by default: request the microphone on the first
-    // Start (a user gesture, so the browser shows its permission prompt)
-    if (!mic.on && !mic.autoTried){
-      mic.autoTried = true;
-      enableMic();
-    }
+    // audio ACKs are on by default: request the microphone on Start (a user
+    // gesture, so the browser shows its permission prompt); a denial unticks
+    // the checkbox so this doesn't retry on every Start
+    if (micChk.checked && !mic.on) enableMic();
     state.running = true;
     state.startedAt = performance.now();
     dispFrame = 0;
@@ -2998,6 +3008,18 @@ var qrcode = function() {
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
     releaseWakeLock();
+    // blank the stage — a stopped sender must not leave the last QR frozen
+    // on screen, or the receiver keeps re-reading it as a live packet and
+    // keeps chirping audio ACKs at a sender that is no longer transmitting
+    lastCells = null;
+    if (canvas.width > 20){
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#9aa2ab';
+      ctx.font = '15px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('stopped — no data on screen', canvas.width/2, canvas.height/2);
+    }
     statusBadge.textContent = 'STOPPED';
     statusBadge.className = 'badge idle';
     startBtn.disabled = !state.k;
@@ -3062,11 +3084,12 @@ var qrcode = function() {
   // auto-stops on DONE and prioritizes resending NACKed blocks.
   // ---------------------------------------------------------------------
   var ACKF = { SEP: 1150, PRE_A: 4700, PRE_B: 4400, TONE0: 1500, TSTEP: 180, TOL: 70 };
-  var mic = { ctx: null, stream: null, analyser: null, data: null, timer: null, on: false, autoTried: false };
+  var mic = { ctx: null, stream: null, analyser: null, data: null, timer: null, on: false };
 
   function enableMic(){
     if (mic.on) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      micChk.checked = false;
       log('Microphone API unavailable on this origin — audio ACKs need HTTPS or http://localhost '+
           '(a file:// page cannot use the mic; serve sender.html the same way as receiver.html). '+
           'The transfer still works one-way.');
@@ -3074,6 +3097,7 @@ var qrcode = function() {
     }
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } })
       .then(function(s){
+        if (!micChk.checked){ s.getTracks().forEach(function(t){ t.stop(); }); return; } // unticked while prompting
         mic.stream = s;
         mic.ctx = new (window.AudioContext||window.webkitAudioContext)();
         var src = mic.ctx.createMediaStreamSource(s);
@@ -3084,26 +3108,25 @@ var qrcode = function() {
         mic.data = new Float32Array(mic.analyser.frequencyBinCount);
         mic.timer = setInterval(pollFsk, 18);
         mic.on = true;
-        micBtn.textContent = 'Disable ACK Mic';
         log('ACK microphone enabled — listening for receiver audio acknowledgements.');
       })
       .catch(function(err){
+        micChk.checked = false;
         log('Microphone permission denied or unavailable: '+err.message+
-            ' — the transfer still works one-way; click "Enable ACK Mic" to retry.');
+            ' — the transfer still works one-way; re-tick the ACK mic checkbox to retry.');
       });
   }
-  micBtn.addEventListener('click', function(){
-    if (mic.on){ disableMic(); return; }
-    enableMic();
-  });
   function disableMic(){
     if (mic.timer) clearInterval(mic.timer);
     if (mic.stream) mic.stream.getTracks().forEach(function(t){ t.stop(); });
     if (mic.ctx){ try{ mic.ctx.close(); }catch(e){} }
     mic.ctx = null; mic.stream = null; mic.analyser = null; mic.timer = null; mic.on = false;
-    micBtn.textContent = 'Enable ACK Mic';
     log('ACK microphone disabled.');
   }
+  micChk.addEventListener('change', function(){
+    if (micChk.checked) enableMic();
+    else if (mic.on) disableMic();
+  });
 
   function symbolForFreq(f){
     if (Math.abs(f-ACKF.PRE_A) < ACKF.TOL) return 17;
@@ -3172,20 +3195,27 @@ var qrcode = function() {
     handleAckMessage(bytes);
   }
 
+  var doneAckLogAt = 0;
   function handleAckMessage(b){
     if (!state.sessionId || b[1] !== (state.sessionId & 0xff)) return;
     if (b[0] === 0xD1){
-      log('AUDIO ACK: receiver confirmed transfer COMPLETE — stopping broadcast.');
-      if (state.running) stopBroadcast();
-      statusBadge.textContent = 'DONE (ACKED)';
-      statusBadge.className = 'badge run';
       state.ackSolved = state.k; state.ackAt = Date.now();
       progEl.value = 1;
-      playChime(mic.ctx);
+      if (state.running){
+        log('AUDIO ACK: receiver confirmed transfer COMPLETE — stopping broadcast.');
+        stopBroadcast();
+        statusBadge.textContent = 'DONE (ACKED)';
+        statusBadge.className = 'badge run';
+        playChime(mic.ctx);
+      } else if (Date.now() - doneAckLogAt > 15000){
+        doneAckLogAt = Date.now();
+        log('Receiver reports this session is already complete. To send this file again, click "New Transfer" and re-select it.');
+      }
     } else if (b[0] === 0xA2 && b.length >= 4){
       var solved = b[2] | (b[3]<<8);
       state.ackSolved = Math.min(solved, state.k);
       state.ackAt = Date.now();
+      if (!state.running) return; // stale chirp heard after Stop — record it in stats, don't act on it
       var wanted = [];
       for (var i=4;i+1<b.length;i+=2){
         var m = b[i] | (b[i+1]<<8);
