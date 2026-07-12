@@ -4,7 +4,7 @@ Send a file from one device to another with **no Wi-Fi, no Bluetooth, no network
 
 Two single-file, dependency-free HTML pages:
 
-- **[🔗 🌐 `sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes (one or four per display frame) and shows them vsync-paced.
+- **[🔗 🌐 `sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)** — runs in a browser on the device that has the file. Encodes it into a stream of QR codes and shows them vsync-paced.
 - **[🔗 🌐 `receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)**  — runs in a browser on the device with a camera. Watches the screen, reconstructs the file, verifies it, plays a success chime, and downloads it automatically.
 
 Both files are fully self-contained: all required libraries are inlined directly into the HTML. Once loaded, neither page makes any network request, ever. They work identically on desktop and mobile (Android/iOS), in any modern browser.
@@ -14,7 +14,7 @@ Both files are fully self-contained: all required libraries are inlined directly
 - **Systematic first pass** — every block is sent once, verbatim, before any coding; a clean capture completes with zero overhead.
 - **Seed-derived fountain packets** — block indices are re-derived on the receiver from `(sessionId, packetId, k)`, so no index list travels over the wire (and the v1 bug where high-degree packets silently overflowed the QR capacity is structurally impossible).
 - **Metadata piggybacked in every data packet** — the receiver can start (and finish) decoding from the very first frame it sees; the header frame only carries the filename.
-- **Up to 4 QR codes per display frame** (2×2 grid) and frame intervals down to 50 ms.
+- **Frame intervals down to 50 ms**, vsync-paced, with the next frame pre-built during the current one. (A 2×2 multi-QR grid and an extra-dense preset were field-tested and removed: real-world cameras could not resolve them reliably.)
 - **Frame-change beacon + identical-frame skip** — the receiver cheaply detects stale frames instead of re-decoding them.
 - **Native `BarcodeDetector`** (hardware QR decoding, multi-code per frame) is used automatically once it has been verified binary-safe against jsQR; all decoding runs in a Web Worker off the main thread, with full-resolution ROI tracking.
 - **Audio ACK back-channel (optional)** — the receiver's speaker sends short FSK messages that the sender's microphone decodes: live progress, targeted resend requests for the last few missing blocks, and a DONE signal that auto-stops the sender.
@@ -29,7 +29,7 @@ Both files are fully self-contained: all required libraries are inlined directly
 On the device that has the file, just double-click `sender.html` (or open it via `File → Open` in your browser). No server needed for the sender.
 
 1. Choose a file.
-2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)), a frame interval, and how many codes per frame (the 2×2 grid — 4 codes per frame — is the default; drop to a single QR if the receiver's camera struggles to resolve the smaller codes).
+2. Pick a quality preset (**Balanced** is the default — see [Choosing a preset](#choosing-a-preset)) and a frame interval.
 3. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
 4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion. Denying (or the prompt not appearing) just means one-way mode; use **Enable ACK Mic** to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page, serve it from the same local server as the receiver to use audio ACKs.
 
@@ -62,11 +62,10 @@ Click **New Transfer** on the sender (lets you choose a new file). Every click o
 
 | Preset                   | QR version                                  | Data per code | Notes                                                                                                                                        |
 | ------------------------ | ------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dense**                | 30 (137×137 modules)                        | 1703 B        | Fastest, but needs a steady hand, good focus, and good lighting. Best for laptop screen → phone camera at close range.                       |
 | **Balanced** *(default)* | 22 (105×105 modules)                        | 974 B         | Good speed/reliability trade-off for most phone cameras at arm's length.                                                                     |
 | **Robust**               | 15 (77×77 modules), higher error-correction | 383 B         | Slowest, but will scan reliably even with a poor camera, bad lighting, or some hand shake. Use this if Balanced is failing to make progress. |
 
-With the 2×2 grid, four codes are shown per frame (each code is smaller on screen, so the camera needs to be closer or the screen bigger). Theoretical rates at Balanced: ~9.7 KB/s at 10 frames/s single-code, ~39 KB/s at 10 frames/s with the grid, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" or miss counts climb, slow the interval down or drop to a single code before reaching for the Robust preset.
+Theoretical rate at Balanced is ~9.7 KB/s at 10 frames/s, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" count climbs or progress stalls, slow the interval down before reaching for the Robust preset. (An extra-dense version-30 preset and a 2×2 multi-QR grid existed briefly and were removed — in field tests typical cameras never decoded them.)
 
 ---
 
@@ -241,13 +240,13 @@ Sent as the first two frames and every 40th frame thereafter. Since v2 piggyback
 | payload        | `blockSize` B | The block itself, or the XOR of the derived index set                               |
 | packetCrc      | 4 B           | CRC32 over all preceding bytes                                                      |
 
-Overhead is a constant **29 bytes**, so `blockSize = QR byte capacity − 29` (1703 / 974 / 383 B for Dense / Balanced / Robust).
+Overhead is a constant **29 bytes**, so `blockSize = QR byte capacity − 29` (974 / 383 B for Balanced / Robust).
 
 ## Audio ACK back-channel (optional)
 
 Receiver speaker → sender microphone. 16-FSK: sixteen data tones at 1500–4200 Hz (180 Hz apart), separator tone 1150 Hz, preamble alternating 4700/4400 Hz, 90 ms slots. Each message is `preamble(4 slots) · [SEP, nibble]×2·len · END(4700 Hz)` with a CRC-8 (poly `0x07`) appended:
 
-- **DONE** `[0xD1, sessionIdLow]` — repeated up to 10 times after completion. The sender verifies the session byte, stops broadcasting, and plays the chime.
+- **DONE** `[0xD1, sessionIdLow]` — repeated 3 times after completion (enough for the sender to catch one without becoming a nuisance). The sender verifies the session byte, stops broadcasting, and plays the chime.
 - **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — chirped every ~8 s throughout the transfer (so the sender shows live receiver progress), tightening to every ~5 s with up to 3 missing block indices once ≥ 85% of blocks are solved. The sender pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
 
 Data rate is tiny (~20 bit/s) and that's fine: the QR channel carries the data; sound only carries *control*. The success chime uses notes at 523–1047 Hz, entirely below the FSK band, so it can never be mistaken for a symbol. Everything works with the channel disabled — it's an accelerator, not a dependency.
@@ -258,15 +257,15 @@ Data rate is tiny (~20 bit/s) and that's fine: the QR channel carries the data; 
 - Fixed QR version per preset so every frame has identical dimensions — keeps camera focus/exposure stable.
 - Each code is generated as a **1-pixel-per-module `ImageData`** (4-module quiet zone included) and blitted with `imageSmoothingEnabled = false` at an exact integer scale — crisp, pixel-aligned modules with no anti-aliased edges, and far cheaper than per-module `fillRect`.
 - Frame pacing uses `requestAnimationFrame` (vsync-aligned), with the *next* frame's codes built incrementally during the *current* frame's display window, so a swap is just a blit. Missed deadlines are counted in the stats ("Missed swap deadlines").
-- Below the code grid, a **beacon bar** (two half-bars swapping black/white every frame) makes frame changes trivially observable.
-- ECC level **L** for Dense/Balanced (inter-frame redundancy comes from the fountain code, so paying for intra-frame redundancy is usually a bad trade), **M** for Robust.
+- Below the code, a **beacon bar** (two half-bars swapping black/white every frame) makes frame changes trivially observable.
+- ECC level **L** for Balanced (inter-frame redundancy comes from the fountain code, so paying for intra-frame redundancy is usually a bad trade), **M** for Robust.
 
 ## Receiver capture & decode details
 
 - Camera is requested at 1920×1080@60 with `facingMode: environment`; continuous autofocus is applied when supported and a zoom slider appears when the track exposes zoom.
 - `video.requestVideoFrameCallback` (rAF fallback) fires once per *camera* frame; exactly one frame is in flight at a time (natural backpressure).
 - All pixel work happens in a **Web Worker** (the vendored jsQR source is stored in an inert `text/plain` script tag and prepended into the worker blob; if workers/OffscreenCanvas are unavailable, it's eval'd on the main thread as a fallback).
-- **ROI tracking**: full-frame search (alternating whole-frame and 2×2 quadrant sweeps, for grid mode) until a code is found, then each known code region is cropped from the **full-resolution** frame — no global downscale throwing away module detail. Boxes follow drift, expire after repeated misses, and a periodic sweep discovers additional grid cells.
+- **ROI tracking**: full-frame search (alternating whole-frame and quadrant sweeps, so a small code anywhere in the frame is found at high effective resolution) until a code is found, then the code's region is cropped from the **full-resolution** frame — no global downscale throwing away module detail. The box follows drift and expires after repeated misses.
 - **Identical-frame skip**: a 16×16 luminance signature per region; if it matches the last attempt, the decode is skipped (the sender never shows the same packet twice in a row, so an unchanged region is always stale). This is where most of the "duplicate decode" CPU waste of v1 went.
 - **Native `BarcodeDetector`**: if present, it runs in *probation* alongside jsQR and must return byte-identical results 4 times before taking over (its `rawValue` is a string; on binary-safe platforms that's a 1:1 Latin-1 mapping, on others it mangles bytes ≥ 0x80 — probation detects which world we're in using real traffic, no test assets needed). Once active, it decodes full frames in hardware, multiple codes at once. Any rare packet that happens to decode as valid UTF-8 and gets mangled simply fails its CRC and is repaired by the fountain stream.
 
@@ -305,7 +304,7 @@ All are included verbatim inside the HTML files — there are no `<script src="h
 
 ## Known limits
 
-- Max `k` (block count) is 65,535 due to the 16-bit block-count field. At the smallest block size (Robust, 383 B) that's a ceiling of roughly 24 MB compressed; with the Dense preset it's ~110 MB.
+- Max `k` (block count) is 65,535 due to the 16-bit block-count field. At the Robust block size (383 B) that's a ceiling of roughly 24 MB compressed; at Balanced (974 B) it's ~62 MB.
 - The audio ACK channel assumes the two devices are within normal speaking distance in a reasonably quiet room; in a loud environment just leave it off — the protocol degrades to pure one-way broadcast.
 - Sender and receiver must be the **same protocol version** (v2 files, as shipped together). A v2 receiver logs a clear warning if it sees v1 packets.
 

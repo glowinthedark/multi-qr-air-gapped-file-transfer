@@ -47,7 +47,6 @@
       <div>
         <label>Quality preset</label>
         <select id="preset">
-          <option value="dense">Dense (fastest, needs steady camera &amp; good light)</option>
           <option value="balanced" selected>Balanced (recommended)</option>
           <option value="robust">Robust (slowest, max compatibility)</option>
         </select>
@@ -60,13 +59,6 @@
           <option value="100" selected>100 ms (10 QR/s)</option>
           <option value="150">150 ms (6.6 QR/s)</option>
           <option value="250">250 ms (4 QR/s)</option>
-        </select>
-      </div>
-      <div>
-        <label>Codes per frame</label>
-        <select id="gridSel">
-          <option value="1">1 (single QR)</option>
-          <option value="2" selected>4 (2&times;2 grid)</option>
         </select>
       </div>
     </div>
@@ -108,7 +100,7 @@
    pass (every block once, verbatim) followed by fountain-coded repair
    packets whose block indices are DERIVED on both ends from (sessionId,
    packetId, k) via a shared deterministic PRNG (nothing but the packet id
-   travels over the wire) -> rendered as 1 or 4 QR codes per display frame,
+   travels over the wire) -> rendered as one QR code per display frame,
    vsync-paced, with an alternating beacon bar so the receiver can skip
    stale frames. Optional audio ACK back-channel: the receiver's speaker
    sends FSK progress/done messages that this page's microphone decodes to
@@ -2564,7 +2556,6 @@ var qrcode = function() {
   // (v1 sent explicit indices, which overflowed QR capacity for degree>8.)
   // ---------------------------------------------------------------------
   var PRESETS = {
-    dense:    { type: 30, ecc: 'L', capacity: 1732, modules: 137 },
     balanced: { type: 22, ecc: 'L', capacity: 1003, modules: 105 },
     robust:   { type: 15, ecc: 'M', capacity: 412,  modules: 77  }
   };
@@ -2577,7 +2568,6 @@ var qrcode = function() {
   var fileInput = document.getElementById('fileInput');
   var presetSel = document.getElementById('preset');
   var intervalSel = document.getElementById('interval');
-  var gridSel = document.getElementById('gridSel');
   var startBtn = document.getElementById('startBtn');
   var stopBtn = document.getElementById('stopBtn');
   var resetBtn = document.getElementById('resetBtn');
@@ -2638,7 +2628,6 @@ var qrcode = function() {
       ['Blocks (k)', state.k || '—'],
       ['Block size', state.blockSize ? state.blockSize+' B' : '—'],
       ['QR version / ECC', state.k ? (PRESETS[presetSel.value].type+' / '+PRESETS[presetSel.value].ecc) : '—'],
-      ['Codes per frame', gridSel.value==='2' ? '4 (2×2)' : '1'],
       ['Session ID', state.sessionId ? ('0x'+state.sessionId.toString(16)) : '—'],
       ['Display frames shown', state.framesShown],
       ['Data packets sent', state.packetsSent],
@@ -2704,9 +2693,6 @@ var qrcode = function() {
   presetSel.addEventListener('change', function(){
     if (state.fileBytes) prepareFile(state.fileName, state.fileBytes);
   });
-  gridSel.addEventListener('change', function(){
-    if (state.k) computeLayout();
-  });
 
   var scratchB = null, scratchW = null;
 
@@ -2726,7 +2712,7 @@ var qrcode = function() {
       state.blockSize = preset.capacity - DATA_OVERHEAD;
       state.k = Math.max(1, Math.ceil(compressed.length / state.blockSize));
       if (state.k > 65535){
-        fileInfo.textContent = 'File too large for this preset ('+state.k+' blocks > 65535). Pick a denser preset or a smaller file.';
+        fileInfo.textContent = 'File too large for this preset ('+state.k+' blocks > 65535). Use the Balanced preset or a smaller file.';
         state.k = 0;
         return;
       }
@@ -2872,7 +2858,8 @@ var qrcode = function() {
   var layout = null;
   function computeLayout(){
     var preset = PRESETS[presetSel.value];
-    var g = parseInt(gridSel.value, 10);
+    var g = 1; // single QR per frame (a 2x2 grid was tried and reverted:
+               // real-world cameras could not resolve the smaller codes)
     var mods = preset.modules + 8;
     var fs = document.fullscreenElement != null;
     var target = Math.min(window.innerWidth*(fs?0.99:0.95), window.innerHeight*(fs?0.92:0.86));
@@ -2995,7 +2982,6 @@ var qrcode = function() {
     stopBtn.disabled = false;
     fileInput.disabled = true;
     presetSel.disabled = true;
-    gridSel.disabled = true;
     computeLayout();
     startBuild();
     while (!pendingReady) buildStep();
@@ -3003,8 +2989,7 @@ var qrcode = function() {
     rafId = requestAnimationFrame(loop);
     acquireWakeLock();
     log('Started broadcasting session 0x'+state.sessionId.toString(16)+': '+intervalSel.value+
-        'ms/frame, preset='+presetSel.value+', '+(layout.g*layout.g)+
-        ' code(s)/frame. Systematic pass first, then fountain.');
+        'ms/frame, preset='+presetSel.value+'. Systematic pass first, then fountain.');
   });
 
   stopBtn.addEventListener('click', stopBroadcast);
@@ -3019,7 +3004,6 @@ var qrcode = function() {
     stopBtn.disabled = true;
     fileInput.disabled = false;
     presetSel.disabled = false;
-    gridSel.disabled = false;
     log('Stopped. '+state.framesShown+' frames shown, '+state.packetsSent+' data packets sent.');
   }
 

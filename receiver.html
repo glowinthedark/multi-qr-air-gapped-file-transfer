@@ -10697,7 +10697,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (!ackChk.checked || S.sessionId === null) return;
     var now = Date.now();
     if (S.complete){
-      if (S.doneAcks < 10 && now - S.lastAckAt > 2500){
+      // three DONE repeats is enough for the sender to catch one; anything
+      // more is just noise once the file is already on disk
+      if (S.doneAcks < 3 && now - S.lastAckAt > 2500){
         if (sendAck([0xD1, S.sessionId & 0xff])){ S.doneAcks++; S.lastAckAt = now; }
       }
       return;
@@ -10916,13 +10918,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       var w = W*0.58, h = H*0.58;
       return [[0,0,w,h],[W-w,0,w,h],[0,H-h,w,h],[W-w,H-h,w,h]];
     }
-    function boxNear(nb){
-      var ncx = nb.x+nb.w/2, ncy = nb.y+nb.h/2;
-      return boxes.some(function(b){
-        return Math.abs(b.box.x+b.box.w/2-ncx) < nb.w/2 && Math.abs(b.box.y+b.box.h/2-ncy) < nb.h/2;
-      });
-    }
-
     function jsqrPass(W, H, skipped){
       var found = [];
       if (mode === 'search'){
@@ -10955,18 +10950,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         }
         boxes = boxes.filter(function(b){ return b.miss < 25; });
         if (!boxes.length) mode = 'search';
-        else if (boxes.length < 4 && frameNo % 15 === 0){
-          // periodic sweep: discover additional grid cells / re-center drift
-          var qs2 = quadrants(W, H);
-          for (var i=0;i<qs2.length;i++){
-            var res4 = scanRegion(qs2[i][0], qs2[i][1], qs2[i][2], qs2[i][3], 700, null);
-            if (res4.r){
-              found.push(res4.r);
-              var nb = grow(res4.r.box, GROW);
-              if (!boxNear(nb)) boxes.push({box:nb, miss:0, sig:null});
-            }
-          }
-        }
       }
       return found;
     }
@@ -11003,7 +10986,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   var stream = null, busy = false, pumping = false;
   var scanCanvas = document.createElement('canvas');
   var sctx = scanCanvas.getContext('2d', {willReadFrequently:true});
-  var mtSig = null, mtFlip = false;
+  var mtSig = null;
 
   function onWorkerMsg(ev){
     var d = ev.data;
@@ -11058,36 +11041,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     mtSig = sig;
     S.framesScanned++;
     var results = [];
-    mtFlip = !mtFlip;
-    if (mtFlip){
-      var r = null;
-      try { r = jsQR(imgData.data, cw, ch, {inversionAttempts:'dontInvert'}); } catch(e){}
-      if (r && r.binaryData && r.binaryData.length){
-        var L = r.location, inv = 1/scale;
-        results.push({bytes:new Uint8Array(r.binaryData).buffer, corners:[
-          {x:L.topLeftCorner.x*inv, y:L.topLeftCorner.y*inv},
-          {x:L.topRightCorner.x*inv, y:L.topRightCorner.y*inv},
-          {x:L.bottomRightCorner.x*inv, y:L.bottomRightCorner.y*inv},
-          {x:L.bottomLeftCorner.x*inv, y:L.bottomLeftCorner.y*inv}]});
-      }
-    } else {
-      // quadrant pass so 2x2 sender grids still work without the worker
-      var qw = Math.round(cw*0.58), qh = Math.round(ch*0.58);
-      var qs = [[0,0],[cw-qw,0],[0,ch-qh],[cw-qw,ch-qh]];
-      for (var qi=0;qi<qs.length;qi++){
-        var qImg;
-        try { qImg = sctx.getImageData(qs[qi][0], qs[qi][1], qw, qh); } catch(e){ continue; }
-        var qr = null;
-        try { qr = jsQR(qImg.data, qw, qh, {inversionAttempts:'dontInvert'}); } catch(e){}
-        if (qr && qr.binaryData && qr.binaryData.length){
-          var QL = qr.location, inv2 = 1/scale;
-          results.push({bytes:new Uint8Array(qr.binaryData).buffer, corners:[
-            {x:(qs[qi][0]+QL.topLeftCorner.x)*inv2, y:(qs[qi][1]+QL.topLeftCorner.y)*inv2},
-            {x:(qs[qi][0]+QL.topRightCorner.x)*inv2, y:(qs[qi][1]+QL.topRightCorner.y)*inv2},
-            {x:(qs[qi][0]+QL.bottomRightCorner.x)*inv2, y:(qs[qi][1]+QL.bottomRightCorner.y)*inv2},
-            {x:(qs[qi][0]+QL.bottomLeftCorner.x)*inv2, y:(qs[qi][1]+QL.bottomLeftCorner.y)*inv2}]});
-        }
-      }
+    var r = null;
+    try { r = jsQR(imgData.data, cw, ch, {inversionAttempts:'dontInvert'}); } catch(e){}
+    if (r && r.binaryData && r.binaryData.length){
+      var L = r.location, inv = 1/scale;
+      results.push({bytes:new Uint8Array(r.binaryData).buffer, corners:[
+        {x:L.topLeftCorner.x*inv, y:L.topLeftCorner.y*inv},
+        {x:L.topRightCorner.x*inv, y:L.topRightCorner.y*inv},
+        {x:L.bottomRightCorner.x*inv, y:L.bottomRightCorner.y*inv},
+        {x:L.bottomLeftCorner.x*inv, y:L.bottomLeftCorner.y*inv}]});
     }
     decoderLabel = 'jsQR (main thread)';
     drawOverlayMulti(results);
