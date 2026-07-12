@@ -65,8 +65,8 @@
       <div>
         <label>Codes per frame</label>
         <select id="gridSel">
-          <option value="1" selected>1 (single QR)</option>
-          <option value="2">4 (2&times;2 grid)</option>
+          <option value="1">1 (single QR)</option>
+          <option value="2" selected>4 (2&times;2 grid)</option>
         </select>
       </div>
     </div>
@@ -2970,6 +2970,22 @@ var qrcode = function() {
 
   startBtn.addEventListener('click', function(){
     if (!state.k) return;
+    // fresh session on EVERY broadcast — a rebroadcast of the same prepared
+    // file must not reuse the old sessionId, or a receiver that already
+    // completed that session would silently ignore the whole stream.
+    state.sessionId = (Math.random()*0xFFFFFFFF)>>>0;
+    state.nextSystematic = 0;
+    state.nextFountain = state.k;
+    state.framesShown = 0; state.packetsSent = 0; state.headerFramesSent = 0;
+    state.payloadBytesSent = 0; state.buildLag = 0;
+    state.ackSolved = -1;
+    ackQueue.length = 0; ackQueued.clear();
+    // audio ACKs are on by default: request the microphone on the first
+    // Start (a user gesture, so the browser shows its permission prompt)
+    if (!mic.on && !mic.autoTried){
+      mic.autoTried = true;
+      enableMic();
+    }
     state.running = true;
     state.startedAt = performance.now();
     dispFrame = 0;
@@ -2986,8 +3002,9 @@ var qrcode = function() {
     nextSwap = performance.now();
     rafId = requestAnimationFrame(loop);
     acquireWakeLock();
-    log('Started broadcasting: '+intervalSel.value+'ms/frame, preset='+presetSel.value+
-        ', '+(layout.g*layout.g)+' code(s)/frame. Systematic pass first, then fountain.');
+    log('Started broadcasting session 0x'+state.sessionId.toString(16)+': '+intervalSel.value+
+        'ms/frame, preset='+presetSel.value+', '+(layout.g*layout.g)+
+        ' code(s)/frame. Systematic pass first, then fountain.');
   });
 
   stopBtn.addEventListener('click', stopBroadcast);
@@ -3061,10 +3078,16 @@ var qrcode = function() {
   // auto-stops on DONE and prioritizes resending NACKed blocks.
   // ---------------------------------------------------------------------
   var ACKF = { SEP: 1150, PRE_A: 4700, PRE_B: 4400, TONE0: 1500, TSTEP: 180, TOL: 70 };
-  var mic = { ctx: null, stream: null, analyser: null, data: null, timer: null, on: false };
+  var mic = { ctx: null, stream: null, analyser: null, data: null, timer: null, on: false, autoTried: false };
 
-  micBtn.addEventListener('click', function(){
-    if (mic.on){ disableMic(); return; }
+  function enableMic(){
+    if (mic.on) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      log('Microphone API unavailable on this origin — audio ACKs need HTTPS or http://localhost '+
+          '(a file:// page cannot use the mic; serve sender.html the same way as receiver.html). '+
+          'The transfer still works one-way.');
+      return;
+    }
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } })
       .then(function(s){
         mic.stream = s;
@@ -3080,7 +3103,14 @@ var qrcode = function() {
         micBtn.textContent = 'Disable ACK Mic';
         log('ACK microphone enabled — listening for receiver audio acknowledgements.');
       })
-      .catch(function(err){ log('Microphone unavailable: '+err.message+' (transfer still works one-way).'); });
+      .catch(function(err){
+        log('Microphone permission denied or unavailable: '+err.message+
+            ' — the transfer still works one-way; click "Enable ACK Mic" to retry.');
+      });
+  }
+  micBtn.addEventListener('click', function(){
+    if (mic.on){ disableMic(); return; }
+    enableMic();
   });
   function disableMic(){
     if (mic.timer) clearInterval(mic.timer);
@@ -3183,7 +3213,8 @@ var qrcode = function() {
   }
 
   renderStats();
-  log('Ready. Select a file to begin. Optionally enable the ACK mic so the receiver can auto-stop this sender.');
+  log('Ready. Select a file to begin. Audio ACKs are enabled by default — the microphone permission '+
+      'will be requested when you start broadcasting (needs HTTPS or localhost; denying it just means one-way mode).');
 })();
 </script>
 </body>

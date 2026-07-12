@@ -10375,7 +10375,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       pivots: new Map(), // pivotIndex -> {indices:Set, row}
       seen: new Map(),   // "sid:pid" -> last-accepted timestamp (short-lived; camera dedup only)
       framesScanned: 0, framesDecoded: 0, framesRejected: 0, framesDuplicate: 0, framesSkipped: 0,
-      lastDegree: 0,
+      lastDegree: 0, sawFirstPacket: false,
       startedAt: Date.now(), completedAt: 0, complete: false, finalBytes: null,
       lastAckAt: 0, doneAcks: 0, warnedOldSender: false
     };
@@ -10562,7 +10562,12 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     } catch(e){
       log('Parse error (ignored): '+e.message);
     }
-    if (res === 'ok') S.framesDecoded++;
+    if (res === 'ok'){
+      // start the throughput clock at the first accepted packet, not at page
+      // load/reset — otherwise time spent aiming the camera deflates the rate
+      if (!S.sawFirstPacket){ S.sawFirstPacket = true; S.startedAt = Date.now(); }
+      S.framesDecoded++;
+    }
     else if (res === 'dup') S.framesDuplicate++;
     else S.framesRejected++;
     if (res === 'ok') checkCompletion();
@@ -10600,6 +10605,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     resultPanel.style.display = 'block';
     playChime();
     triggerDownload();
+    log('If the download did not start automatically (browsers may ask permission for repeated downloads), use the Download File button.');
   }
 
   function triggerDownload(){
@@ -10682,7 +10688,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     } catch(e){ return false; }
   }
 
-  // ACK cadence: PROGRESS (with up to 3 missing block indices) every 5s in
+  // ACK cadence: PROGRESS chirps every ~8s throughout the whole transfer
+  // (so the sender shows live progress and the operator can hear the channel
+  // working), tightening to every 5s with up to 3 missing block indices in
   // the endgame; DONE repeated a few times after completion so the sender
   // auto-stops even if it missed one.
   setInterval(function(){
@@ -10692,17 +10700,20 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       if (S.doneAcks < 10 && now - S.lastAckAt > 2500){
         if (sendAck([0xD1, S.sessionId & 0xff])){ S.doneAcks++; S.lastAckAt = now; }
       }
-    } else if (S.meta){
-      var k = S.meta.k, solved = S.solved.size;
-      if (solved >= Math.floor(k*0.85) && now - S.lastAckAt > 5000){
-        var msg = [0xA2, S.sessionId & 0xff, solved & 0xff, (solved>>8) & 0xff];
-        var added = 0;
-        for (var i=0;i<k && added<3;i++){
-          if (!S.solved.has(i)){ msg.push(i & 0xff, (i>>8) & 0xff); added++; }
-        }
-        if (sendAck(msg)) S.lastAckAt = now;
+      return;
+    }
+    if (!S.meta || !S.solved.size) return;
+    var k = S.meta.k, solved = S.solved.size;
+    var endgame = solved >= Math.floor(k*0.85);
+    if (now - S.lastAckAt < (endgame ? 5000 : 8000)) return;
+    var msg = [0xA2, S.sessionId & 0xff, solved & 0xff, (solved>>8) & 0xff];
+    if (endgame){
+      var added = 0;
+      for (var i=0;i<k && added<3;i++){
+        if (!S.solved.has(i)){ msg.push(i & 0xff, (i>>8) & 0xff); added++; }
       }
     }
+    if (sendAck(msg)) S.lastAckAt = now;
   }, 500);
 
   // ---------------------------------------------------------------------
@@ -10744,7 +10755,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   // ---------------------------------------------------------------------
   function decodeWorkerBody(){
     'use strict';
-    var detector = null, detState = 'off', probMatches = 0;
+    var detector = null, detState = 'off', probMatches = 0, probOnlyJs = 0;
     if (typeof BarcodeDetector !== 'undefined'){
       try {
         BarcodeDetector.getSupportedFormats().then(function(fmts){
@@ -10791,6 +10802,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           var js = jsqrPass(W, H, skipped);
           nativeDetect().then(function(nat){
             if (js.length && nat.length){
+              probOnlyJs = 0;
               var eq = nat.some(function(n){ return bytesEq(n.bytes, js[0].bytes); });
               if (eq){
                 if (++probMatches >= 4){
@@ -10800,6 +10812,13 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
               } else {
                 detState = 'off'; detector = null;
                 postMessage({type:'log', msg:'Native decoder mangles binary payloads on this platform — staying on jsQR.'});
+              }
+            } else if (js.length && !nat.length){
+              // native detector consistently fails where jsQR succeeds — stop
+              // paying for the extra detect() call on every frame
+              if (++probOnlyJs >= 60){
+                detState = 'off'; detector = null;
+                postMessage({type:'log', msg:'Native decoder never co-decoded a frame — staying on jsQR.'});
               }
             }
             results = js; finish();

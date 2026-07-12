@@ -29,9 +29,9 @@ Both files are fully self-contained: all required libraries are inlined directly
 On the device that has the file, just double-click `sender.html` (or open it via `File → Open` in your browser). No server needed for the sender.
 
 1. Choose a file.
-2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)), a frame interval, and how many codes per frame (start with 1; switch to the 2×2 grid when the receiver decodes reliably).
-3. *(Optional but recommended)* Click **Enable ACK Mic** and grant microphone permission — the sender will then stop by itself when the receiver confirms completion, and will prioritize resending exactly the blocks the receiver still misses.
-4. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
+2. Pick a quality preset (**Balanced** is the safe default — see [Choosing a preset](#choosing-a-preset)), a frame interval, and how many codes per frame (the 2×2 grid — 4 codes per frame — is the default; drop to a single QR if the receiver's camera struggles to resolve the smaller codes).
+3. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
+4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion. Denying (or the prompt not appearing) just means one-way mode; use **Enable ACK Mic** to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page, serve it from the same local server as the receiver to use audio ACKs.
 
 ### 2. Open the receiver
 
@@ -54,7 +54,7 @@ Then open **`http://localhost:8000/receiver.html`** in your browser.
 
 ### 3. Sending another file
 
-Click **New Transfer** on the sender (picks a new session, lets you choose a new file) and **Reset Session** on the receiver (clears its decoder state). The receiver also detects a new session on its own after a few frames. You don't need to reload either page.
+Click **New Transfer** on the sender (lets you choose a new file). Every click of **Start Broadcasting** mints a fresh session id — even a rebroadcast of the same file — and the receiver detects the new session on its own after a few frames and resets automatically, so you normally don't need to touch the receiver at all (**Reset Session** exists for forcing a manual reset). You don't need to reload either page.
 
 ---
 
@@ -248,7 +248,7 @@ Overhead is a constant **29 bytes**, so `blockSize = QR byte capacity − 29` (1
 Receiver speaker → sender microphone. 16-FSK: sixteen data tones at 1500–4200 Hz (180 Hz apart), separator tone 1150 Hz, preamble alternating 4700/4400 Hz, 90 ms slots. Each message is `preamble(4 slots) · [SEP, nibble]×2·len · END(4700 Hz)` with a CRC-8 (poly `0x07`) appended:
 
 - **DONE** `[0xD1, sessionIdLow]` — repeated up to 10 times after completion. The sender verifies the session byte, stops broadcasting, and plays the chime.
-- **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — sent every ~5 s once ≥ 85% of blocks are solved. The sender displays the receiver's progress and pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
+- **PROGRESS/NACK** `[0xA2, sessionIdLow, solved u16le, (missingIndex u16le)×0..3]` — chirped every ~8 s throughout the transfer (so the sender shows live receiver progress), tightening to every ~5 s with up to 3 missing block indices once ≥ 85% of blocks are solved. The sender pushes the missing indices to the front of its schedule as systematic resends — collapsing the "last few blocks" tail to a few frames.
 
 Data rate is tiny (~20 bit/s) and that's fine: the QR channel carries the data; sound only carries *control*. The success chime uses notes at 523–1047 Hz, entirely below the FSK band, so it can never be mistaken for a symbol. Everything works with the channel disabled — it's an accelerator, not a dependency.
 
