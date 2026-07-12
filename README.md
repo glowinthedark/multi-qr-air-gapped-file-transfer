@@ -80,11 +80,11 @@ _Theoretical_ rate in `Balanced` mode is ~9.7 KB/s at 10 frames/s. Real-world th
 ## Requirements & limitations
 
 - **Browser**: any reasonably modern Chrome, Safari, Firefox, or Edge — desktop or mobile. No extensions or installs. (The native-decoder and worker paths are progressive enhancements; everything falls back gracefully.)
-- **Receiver needs a camera** and a secure origin (`localhost` or HTTPS) to access it.
+- **Receiver needs a camera** (HTTP or HTTPS).
 - **Sender needs a screen** large/bright enough for the receiving camera to read comfortably.
 - Both tabs should stay in the **foreground** — mobile browsers throttle or suspend background tabs. Both pages take a screen wake lock while active so the display won't sleep mid-transfer.
-- The visual channel is **one-way**; the audio ACK channel is an optional enhancement, not a requirement — with it disabled the protocol degrades to pure broadcast exactly like v1.
-- Practical file size range: anything from a few bytes up to tens of megabytes works in principle; very large files just mean a longer broadcast. There's no hard cap baked in beyond the protocol's 65,535-block ceiling (see technical section).
+- The visual channel is **one-way**; the audio ACK channel is an optional enhancement, not a requirement — with it disabled the protocol degrades to pure broadcast.
+- Practical file size range: while there is no hard cap beyond the protocol's 65,535-block ceiling (see technical section) for anything larger than 1MB the transfers will take VERY LONG.
 
 ---
 
@@ -116,7 +116,7 @@ These are apps many people already have installed for other reasons, which happe
 - **X-plore File Manager** — long-standing, widely used file manager with a built-in Wi-Fi/HTTP server mode for browsing/transferring files from a desktop (or another phone's) browser.
 - **Solid Explorer** — popular dual-pane file manager with a "Web Server" share option that works the same way.
 - **MiXplorer** — another major file manager with an HTTP server feature for LAN transfers.
-- **Termux** — not a file-server app per se, but a genuine terminal (installs Python, Node, etc.), so it can run `python3 -m http.server` exactly like a desktop. Open source, widely used by power users; available from [F-Droid](https://f-droid.org/packages/com.termux/)/GitHub rather than Play Store.
+- **Termux** — not a file-server app per se, but a genuine terminal (installs Python, Node, etc.), so it can run `python3 -m http.server` exactly like a desktop. Open source, available from [F-Droid](https://f-droid.org/packages/com.termux/) or GitHub.
 - **KDE Connect** — mainly a phone↔desktop integration tool (notifications, clipboard sync, etc.), but its device file-browsing/SFTP feature can also be used to reach files on the phone from a desktop browser or file manager, if you already use it for other phone-PC syncing.
 
 **Practical recommendation:** for the *receiver* side of this tool, **Simple HTTP Server** or the built-in server in **X-plore**/**Solid Explorer** are the fastest path to getting `receiver.html` reachable at `http://localhost:PORT/...` without touching a terminal. **Share via HTTP** is also handy on the *sender* side if you want to hand someone `sender.html` itself (or the file the receiver downloaded) over the system share sheet with zero setup.
