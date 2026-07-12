@@ -10571,6 +10571,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       // load/reset — otherwise time spent aiming the camera deflates the rate
       if (!S.sawFirstPacket){ S.sawFirstPacket = true; S.startedAt = Date.now(); }
       S.framesDecoded++;
+      lockCameraOnTarget(); // no-op once locked; re-locks after zoom changes
     }
     else if (res === 'dup') S.framesDuplicate++;
     else S.framesRejected++;
@@ -10783,6 +10784,16 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var cv = null, cx = null, rc = null, rcx = null;
     var mode = 'search', flip = false, boxes = [], frameNo = 0;
     var GROW = 0.35;
+    // Stability gate: the sender swaps QR codes asynchronously to the camera
+    // exposure, so ~1 in 3 camera frames straddles a swap (half old code,
+    // half new) and burns a full failed decode. With the gate on, a locked
+    // region is only decoded once its signature has been stable across two
+    // consecutive camera frames AND differs from the last decoded content.
+    // SAME=25 tolerates hand jitter (~5-15) while a real QR swap scores 50+.
+    // If the sender runs so fast that no stable pair ever exists, the gate
+    // starves — detected as a 2s decode drought — and disables itself.
+    var SAME = 25;
+    var gateOn = true, gateOffUntil = 0, lastResultFrame = 0;
 
     self.onmessage = function(ev){
       var d = ev.data;
@@ -10890,10 +10901,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       return {x:b.x-gx, y:b.y-gy, w:b.w+2*gx, h:b.h+2*gy};
     }
 
-    function scanRegion(sx, sy, sw, sh, maxDim, prevSig){
+    function scanRegion(sx, sy, sw, sh, maxDim, gate){
       sx = Math.max(0, Math.floor(sx)); sy = Math.max(0, Math.floor(sy));
       sw = Math.min(cv.width-sx, Math.ceil(sw)); sh = Math.min(cv.height-sy, Math.ceil(sh));
-      if (sw < 32 || sh < 32) return {r:null, sig:null, skip:false};
+      if (sw < 32 || sh < 32) return {rs:[], skip:false};
       var sc = Math.min(1, maxDim/Math.max(sw, sh));
       var w = Math.max(1, Math.round(sw*sc)), h = Math.max(1, Math.round(sh*sc));
       if (!rc || rc.width < w || rc.height < h){
@@ -10903,7 +10914,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       rcx.drawImage(cv, sx, sy, sw, sh, 0, 0, w, h);
       var img = rcx.getImageData(0, 0, w, h);
       var sig = sigOf(img);
-      if (prevSig && sigDiff(sig, prevSig) < 5) return {rs:[], sig:sig, skip:true};
+      if (gate){
+        var prevSeen = gate.seen;
+        gate.seen = sig;
+        // frame just changed: could be mid-swap tearing — wait for stability
+        if (gateOn && prevSeen && sigDiff(sig, prevSeen) >= SAME) return {rs:[], skip:true};
+        // stable but same content as the last successful decode: stale dup
+        if (gate.done && sigDiff(sig, gate.done) < SAME) return {rs:[], skip:true};
+      }
       var out = [];
       var r = null;
       try { r = jsQR(img.data, w, h, {inversionAttempts:'dontInvert'}); } catch(e){}
@@ -10922,7 +10940,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         out.push({bytes:new Uint8Array(r.binaryData), corners:cs,
                   box:{x:minX, y:minY, w:maxX-minX, h:maxY-minY}});
       }
-      return {rs:out, sig:sig, skip:false};
+      if (out.length && gate) gate.done = sig;
+      return {rs:out, skip:false};
     }
 
     function quadrants(W, H){
@@ -10945,15 +10964,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           }
         }
         if (hits.length){
-          boxes = hits.map(function(b){ return {box:grow(b, GROW), miss:0, sig:null}; });
+          boxes = hits.map(function(b){ return {box:grow(b, GROW), miss:0, gate:{seen:null, done:null}}; });
           mode = 'locked';
+          lastResultFrame = frameNo;
         }
       } else {
         for (var i=0;i<boxes.length;i++){
           var bx = boxes[i], b = bx.box;
-          var res3 = scanRegion(b.x, b.y, b.w, b.h, 720, bx.sig);
-          bx.sig = res3.sig;
-          if (res3.skip){ skipped.n++; continue; }
+          var res3 = scanRegion(b.x, b.y, b.w, b.h, 720, bx.gate);
+          if (res3.skip){ skipped.n++; continue; } // settling or stale dup — not a miss
           if (res3.rs.length){
             bx.box = grow(res3.rs[0].box, GROW);
             bx.miss = 0;
@@ -10962,6 +10981,21 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         }
         boxes = boxes.filter(function(b){ return b.miss < 25; });
         if (!boxes.length) mode = 'search';
+        // gate self-check: a 2s decode drought while locked means the gate
+        // never sees a stable frame pair (sender faster than the camera) —
+        // fall back to gate-less decoding for a while
+        if (found.length){
+          lastResultFrame = frameNo;
+          if (!gateOn && frameNo >= gateOffUntil){
+            gateOn = true;
+            postMessage({type:'log', msg:'Stability gate re-enabled.'});
+          }
+        } else if (gateOn && frameNo - lastResultFrame > 60){
+          gateOn = false;
+          gateOffUntil = frameNo + 600;
+          lastResultFrame = frameNo;
+          postMessage({type:'log', msg:'Stability gate paused — decode drought (sender may be outrunning the camera).'});
+        }
       }
       return found;
     }
@@ -10998,7 +11032,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   var stream = null, busy = false, pumping = false;
   var scanCanvas = document.createElement('canvas');
   var sctx = scanCanvas.getContext('2d', {willReadFrequently:true});
-  var mtSig = null;
+  var mtGate = {seen:null, done:null}, mtGateOn = true, mtLastResultAt = 0, mtGateOffUntil = 0;
 
   function onWorkerMsg(ev){
     var d = ev.data;
@@ -11037,25 +11071,41 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     sctx.drawImage(video, 0, 0, cw, ch);
     var imgData;
     try { imgData = sctx.getImageData(0, 0, cw, ch); } catch(e){ return; }
-    // identical-frame skip (16x16 luminance signature)
-    var N = 16, sig = new Uint8Array(N*N);
+    // 16x16 luminance signature: stability gate (skip mid-swap tearing) +
+    // stale-duplicate skip, mirroring the worker's logic (SAME=25)
+    var N = 16, SAME = 25, sig = new Uint8Array(N*N);
     for (var j=0;j<N;j++){
       for (var i=0;i<N;i++){
         var x = Math.floor((i+0.5)*cw/N), y = Math.floor((j+0.5)*ch/N);
         sig[j*N+i] = imgData.data[(y*cw+x)*4+1];
       }
     }
-    if (mtSig){
+    function mtDiff(a, b){
       var s = 0;
-      for (var i=0;i<sig.length;i++) s += Math.abs(sig[i]-mtSig[i]);
-      if (s/sig.length < 5){ mtSig = sig; S.framesScanned++; S.framesSkipped++; return; }
+      for (var i=0;i<a.length;i++) s += Math.abs(a[i]-b[i]);
+      return s/a.length;
     }
-    mtSig = sig;
+    var nowMs = Date.now();
+    var hadSeen = !!mtGate.seen;
+    var diffPrev = hadSeen ? mtDiff(sig, mtGate.seen) : 255;
+    mtGate.seen = sig;
     S.framesScanned++;
+    if (mtGateOn && hadSeen && diffPrev >= SAME){
+      // frame just changed — wait one frame for stability (torn-frame guard);
+      // if this starves decoding for 2s, pause the gate for a while
+      S.framesSkipped++;
+      if (!mtLastResultAt) mtLastResultAt = nowMs;
+      if (nowMs - mtLastResultAt > 2000){ mtGateOn = false; mtGateOffUntil = nowMs + 20000; }
+      return;
+    }
+    if (mtGate.done && mtDiff(sig, mtGate.done) < SAME){ S.framesSkipped++; return; }
     var results = [];
     var r = null;
     try { r = jsQR(imgData.data, cw, ch, {inversionAttempts:'dontInvert'}); } catch(e){}
     if (r && r.binaryData && r.binaryData.length){
+      mtGate.done = sig;
+      mtLastResultAt = nowMs;
+      if (!mtGateOn && nowMs >= mtGateOffUntil) mtGateOn = true;
       var L = r.location, inv = 1/scale;
       results.push({bytes:new Uint8Array(r.binaryData).buffer, corners:[
         {x:L.topLeftCorner.x*inv, y:L.topLeftCorner.y*inv},
@@ -11150,8 +11200,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     });
   }
 
+  var camTrack = null, camLockDone = false;
   function setupTrackControls(s){
     var track = s.getVideoTracks()[0];
+    camTrack = track;
+    camLockDone = false;
     if (!track || !track.getCapabilities) return;
     try {
       var caps = track.getCapabilities();
@@ -11166,6 +11219,12 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         zoomSlider.value = track.getSettings().zoom || caps.zoom.min;
         zoomSlider.oninput = function(){
           track.applyConstraints({advanced:[{zoom:parseFloat(zoomSlider.value)}]}).catch(function(){});
+          // zooming changes the focal situation — release any lock and let
+          // continuous AF settle; the next decoded packet re-locks
+          if (camLockDone){
+            camLockDone = false;
+            try { track.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(function(){}); } catch(e){}
+          }
         };
       } else {
         zoomRow.style.display = 'none';
@@ -11175,10 +11234,40 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     } catch(e){}
   }
 
+  // Once a packet decodes, the current focus/exposure are by definition good
+  // — pin them so autofocus/auto-exposure can't start hunting mid-transfer
+  // (hunting shows up as minutes-long progress stalls). Best-effort: many
+  // devices don't expose manual modes, in which case this is a no-op.
+  function lockCameraOnTarget(){
+    if (camLockDone || !camTrack || !camTrack.getCapabilities) return;
+    camLockDone = true;
+    try {
+      var caps = camTrack.getCapabilities();
+      var st = camTrack.getSettings();
+      var adv = [], locked = [];
+      if (caps.focusMode && caps.focusMode.indexOf('manual') >= 0 &&
+          caps.focusDistance && st.focusDistance !== undefined){
+        adv.push({focusMode:'manual', focusDistance: st.focusDistance});
+        locked.push('focus');
+      }
+      if (caps.exposureMode && caps.exposureMode.indexOf('manual') >= 0 &&
+          caps.exposureTime && st.exposureTime !== undefined){
+        adv.push({exposureMode:'manual', exposureTime: st.exposureTime});
+        locked.push('exposure');
+      }
+      if (!adv.length) return;
+      camTrack.applyConstraints({advanced: adv}).then(function(){
+        log('Camera '+locked.join(' + ')+' locked at current values — no mid-transfer hunting.');
+      }).catch(function(){ camLockDone = false; });
+    } catch(e){}
+  }
+
   function stopCamera(){
     pumping = false;
     pumpId++;
     busy = false;
+    camTrack = null;
+    camLockDone = false;
     if (stream){ stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
     releaseWakeLock();
   }

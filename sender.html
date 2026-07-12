@@ -54,9 +54,10 @@
       <div>
         <label>Frame interval</label>
         <select id="interval">
+          <option value="auto" selected>Auto (adapts to receiver ACKs)</option>
           <option value="50">50 ms (20 QR/s)</option>
           <option value="66">66 ms (15 QR/s)</option>
-          <option value="100" selected>100 ms (10 QR/s)</option>
+          <option value="100">100 ms (10 QR/s)</option>
           <option value="150">150 ms (6.6 QR/s)</option>
           <option value="250">250 ms (4 QR/s)</option>
         </select>
@@ -2605,9 +2606,42 @@ var qrcode = function() {
     framesShown: 0, packetsSent: 0, headerFramesSent: 0, payloadBytesSent: 0,
     buildLag: 0,
     startedAt: 0,
-    ackSolved: -1, ackAt: 0
+    ackSolved: -1, ackAt: 0,
+    autoIvIdx: 2 // index into AUTO_LADDER, starts at 100ms
   };
   var ackQueue = [], ackQueued = new Set();
+
+  // ---------------------------------------------------------------------
+  // Adaptive frame rate. The receiver's progress ACKs tell us how many
+  // blocks/s it ACTUALLY decodes; blasting frames faster than that only
+  // shortens each QR's on-screen dwell (fewer camera frames per code) and
+  // LOWERS goodput. In "Auto" mode we walk a ladder of intervals toward
+  // the fastest rate the receiver keeps up with.
+  // ---------------------------------------------------------------------
+  var AUTO_LADDER = [50, 66, 100, 150, 250, 400];
+  var ackPrev = null; // {solved, at} from the previous progress ACK
+  function currentInterval(){
+    return intervalSel.value === 'auto' ? AUTO_LADDER[state.autoIvIdx] : parseInt(intervalSel.value, 10);
+  }
+  function adaptRate(solved){
+    var now = Date.now();
+    if (!ackPrev){ ackPrev = {solved: solved, at: now}; return; }
+    var dt = (now - ackPrev.at)/1000;
+    if (dt < 6) return;
+    var rx = Math.max(0, solved - ackPrev.solved)/dt;   // blocks/s decoded by the receiver
+    ackPrev = {solved: solved, at: now};
+    if (intervalSel.value !== 'auto') return;
+    var tx = 1000/AUTO_LADDER[state.autoIvIdx];          // packets/s we are sending
+    var ratio = rx/tx;
+    var oldIdx = state.autoIvIdx;
+    if (ratio < 0.30 && state.autoIvIdx < AUTO_LADDER.length-1) state.autoIvIdx++;
+    else if (ratio > 0.75 && state.autoIvIdx > 0) state.autoIvIdx--;
+    if (state.autoIvIdx !== oldIdx){
+      log('Auto rate: receiver decoded '+rx.toFixed(1)+'/s of '+tx.toFixed(1)+'/s sent ('+
+          Math.round(ratio*100)+'%) — '+(state.autoIvIdx > oldIdx ? 'slowing to ' : 'speeding up to ')+
+          AUTO_LADDER[state.autoIvIdx]+' ms/frame.');
+    }
+  }
 
   function fmtBytes(n){
     if (n < 1024) return n+' B';
@@ -2630,6 +2664,7 @@ var qrcode = function() {
       ['Blocks (k)', state.k || '—'],
       ['Block size', state.blockSize ? state.blockSize+' B' : '—'],
       ['QR version / ECC', state.k ? (PRESETS[presetSel.value].type+' / '+PRESETS[presetSel.value].ecc) : '—'],
+      ['Frame interval', currentInterval()+' ms'+(intervalSel.value === 'auto' ? ' (auto)' : '')],
       ['Session ID', state.sessionId ? ('0x'+state.sessionId.toString(16)) : '—'],
       ['Display frames shown', state.framesShown],
       ['Data packets sent', state.packetsSent],
@@ -2956,7 +2991,7 @@ var qrcode = function() {
         lastCells = pendingCells;
         state.framesShown++;
         dispFrame++;
-        var iv = parseInt(intervalSel.value, 10);
+        var iv = currentInterval();
         nextSwap = (now - nextSwap > iv) ? now + iv : nextSwap + iv;
         startBuild();
         progEl.value = state.ackSolved >= 0
@@ -2983,6 +3018,10 @@ var qrcode = function() {
     // gesture, so the browser shows its permission prompt); a denial unticks
     // the checkbox so this doesn't retry on every Start
     if (micChk.checked && !mic.on) enableMic();
+    ackPrev = null;
+    if (intervalSel.value === 'auto' && !micChk.checked){
+      log('Note: Auto rate needs the ACK mic to measure the receiver — running at a fixed '+currentInterval()+' ms until ACKs arrive.');
+    }
     state.running = true;
     state.startedAt = performance.now();
     dispFrame = 0;
@@ -2998,8 +3037,9 @@ var qrcode = function() {
     nextSwap = performance.now();
     rafId = requestAnimationFrame(loop);
     acquireWakeLock();
-    log('Started broadcasting session 0x'+state.sessionId.toString(16)+': '+intervalSel.value+
-        'ms/frame, preset='+presetSel.value+'. Systematic pass first, then fountain.');
+    log('Started broadcasting session 0x'+state.sessionId.toString(16)+': '+
+        (intervalSel.value === 'auto' ? 'auto rate (starting at '+currentInterval()+'ms)' : intervalSel.value+'ms')+
+        '/frame, preset='+presetSel.value+'. Systematic pass first, then fountain.');
   });
 
   stopBtn.addEventListener('click', stopBroadcast);
@@ -3216,6 +3256,7 @@ var qrcode = function() {
       state.ackSolved = Math.min(solved, state.k);
       state.ackAt = Date.now();
       if (!state.running) return; // stale chirp heard after Stop — record it in stats, don't act on it
+      adaptRate(state.ackSolved);
       var wanted = [];
       for (var i=4;i+1<b.length;i+=2){
         var m = b[i] | (b[i+1]<<8);
