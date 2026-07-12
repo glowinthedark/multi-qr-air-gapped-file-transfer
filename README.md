@@ -9,33 +9,22 @@ Two single-file, dependency-free HTML pages:
 
 Both files are fully self-contained: all required libraries are inlined directly into the HTML. Once loaded, neither page makes any network request, ever. They work identically on desktop and mobile (Android/iOS), in any modern browser.
 
-**Protocol v2** (current) is a significant rework of v1 for speed and reliability:
-
-- **Systematic first pass** — every block is sent once, verbatim, before any coding; a clean capture completes with zero overhead.
-- **Seed-derived fountain packets** — block indices are re-derived on the receiver from `(sessionId, packetId, k)`, so no index list travels over the wire (and the v1 bug where high-degree packets silently overflowed the QR capacity is structurally impossible).
-- **Metadata piggybacked in every data packet** — the receiver can start (and finish) decoding from the very first frame it sees; the header frame only carries the filename.
-- **Frame intervals down to 50 ms**, vsync-paced, with the next frame pre-built during the current one. (A 2×2 multi-QR grid and an extra-dense preset were field-tested and removed: real-world cameras could not resolve them reliably.)
-- **Frame-change beacon + identical-frame skip** — the receiver cheaply detects stale frames instead of re-decoding them.
-- **Native `BarcodeDetector`** (hardware QR decoding, multi-code per frame) is used automatically once it has been verified binary-safe against jsQR; all decoding runs in a Web Worker off the main thread, with full-resolution ROI tracking.
-- **Audio ACK back-channel (optional)** — the receiver's speaker sends short FSK messages that the sender's microphone decodes: live progress, targeted resend requests for the last few missing blocks, and a DONE signal that auto-stops the sender.
-- **Screen wake locks** on both sides, camera zoom/focus controls, native `CompressionStream` compression when available.
-
 ---
 
 ## Quick start
 
 ### 1. Open the sender
 
-On the device that has the file, just double-click `sender.html` (or open it via `File → Open` in your browser). No server needed for the sender.
+On the device that has the file open **[`sender.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/sender.html)**. If no internet available, you can save and double-click `sender.html` to open it as a local file in the browser with the limitation that from the `file://` protocol microphone cannot be used so audio ACK signals won't work.
 
 1. Choose a file.
 2. Pick a quality preset (**Balanced** is the default — see [Choosing a preset](#choosing-a-preset)) and a frame interval.
 3. Click **Start Broadcasting**. Leave the tab in the foreground. **Fullscreen** makes the codes bigger and easier to scan.
-4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion. Denying (or the prompt not appearing) just means one-way mode — the **ACK mic** checkbox unticks itself; re-tick it to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page, serve it from the same local server as the receiver to use audio ACKs.
+4. Audio ACKs are **on by default**: the first Start requests microphone permission — grant it and the sender will show the receiver's live progress, resend exactly the blocks it misses, and stop by itself when the receiver confirms completion (not supported over the `file://` protocol). Denying (or the prompt not appearing) just means one-way mode — the **ACK mic** checkbox unticks itself; re-tick it to retry. ⚠️ Like the receiver's camera, the microphone only works on `https://` or `http://localhost` — if you opened `sender.html` as a plain `file://` page then you can't use audio ACKs.
 
 ### 2. Open the receiver
 
-The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. So you need a tiny local web server on the receiving device:
+Use **[`receiver.html`](https://glowinthedark.github.io/multi-qr-air-gapped-file-transfer/receiver.html)** if you have internet acces on the receiver device. The receiver needs camera access, and browsers only grant camera access on secure origins (`https://` or `http://localhost`) — **not** on a plain `file://` page. So, if you have no internet, then you'll need a tiny local web server on the receiving device:
 
 ```bash
 # from the folder containing receiver.html
@@ -70,7 +59,7 @@ Two related behaviors worth knowing:
 | **Balanced** *(default)* | 22 (105×105 modules)                        | 974 B         | Good speed/reliability trade-off for most phone cameras at arm's length.                                                                     |
 | **Robust**               | 15 (77×77 modules), higher error-correction | 383 B         | Slowest, but will scan reliably even with a poor camera, bad lighting, or some hand shake. Use this if Balanced is failing to make progress. |
 
-Theoretical rate at Balanced is ~9.7 KB/s at 10 frames/s, more at shorter intervals. Real-world throughput depends on the camera; if the receiver's "rejected" count climbs or progress stalls, slow the interval down before reaching for the Robust preset. (Three throughput experiments were field-tested and removed: an extra-dense version-30 preset and a 2×2 multi-QR grid, which typical cameras never decoded, and a color-multiplexed "2×" mode packing two QR codes into the red and blue channels of one image, which was ~2× *slower* — camera Bayer sensors sample R and B at only a quarter of the pixels, so each color channel carries about half the linear resolution of the mono image, and crosstalk cuts contrast further. The lesson generalizes: the camera's pixels-per-module budget is the binding constraint, and any scheme that shrinks the effective module size loses.)
+_Theoretical_ rate in `Balanced` mode is ~9.7 KB/s at 10 frames/s. Real-world throughput depends on the camera and tends to be around 2-3KB/sec; if the receiver's "rejected" count climbs or progress stalls, slow the interval down before reaching for the Robust preset.
 
 ---
 
